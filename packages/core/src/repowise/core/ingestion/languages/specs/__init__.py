@@ -20,6 +20,8 @@ from .csharp import SPEC as _CSHARP
 from .dart import SPEC as _DART
 from .dlang import SPEC as _DLANG
 from .dockerfile import SPEC as _DOCKERFILE
+from .dm import SPEC as _DM
+from .dmf import SPEC as _DMF
 from .elixir import SPEC as _ELIXIR
 from .elm import SPEC as _ELM
 from .erlang import SPEC as _ERLANG
@@ -93,6 +95,7 @@ ALL_SPECS: tuple[LanguageSpec, ...] = (
     _SCALA,
     _DART,
     _PASCAL,
+    _DM,
     # -----------------------------------------------------------------
     # Config / data / markup languages (passthrough — no AST)
     # -----------------------------------------------------------------
@@ -114,6 +117,7 @@ ALL_SPECS: tuple[LanguageSpec, ...] = (
     # root-relative asset paths. Markup, so it is never reported as dead code
     # while its edges still anchor what it references.
     _HTML,
+    _DMF,
     # XAML / AXAML markup for WPF, WinUI 3, UWP, MAUI, Avalonia, Uno.
     # No AST grammar — handled by the XamlDynamicHints extractor which
     # emits ``dynamic_uses`` edges to bound C# types. Registered here so

@@ -39,6 +39,8 @@ LanguageTag = Literal[
     "luau",
     "dart",
     "pascal",
+    "dm",
+    "dmf",
     # Passthrough code languages (no AST parser yet — empty ParsedFile,
     # files enter the graph via the generic resolver). Before these tags
     # existed the traverser silently skipped such files as unknown, so e.g.

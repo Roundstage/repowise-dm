@@ -1,6 +1,6 @@
 # Language Support
 
-**19 languages parsed to a full AST · 35 on the five-rung ladder ·
+**20 languages parsed to a full AST · 36 on the five-rung ladder ·
 framework-aware across all of them.** "Do you support X" has five useful answers
 rather than two, so every language lands on a rung and the rung says what it
 buys you. Everything else in your repo still appears in the wiki and is tracked
@@ -32,6 +32,7 @@ reference.
   <img src="https://img.shields.io/badge/Delphi-EE1F35?style=flat-square&logo=delphi&logoColor=white" alt="Object Pascal / Delphi" />
   &nbsp;<strong>· Partial &nbsp;</strong>
   <img src="https://img.shields.io/badge/Luau-00A2FF?style=flat-square&logo=lua&logoColor=white" alt="Luau" />
+  <img src="https://img.shields.io/badge/BYOND_DM-447FC0?style=flat-square" alt="BYOND Dream Maker" />
 </p>
 
 **Contents:** [Tiers](#tiers) ·
@@ -53,13 +54,13 @@ produce meaningful output.
 |------|-----------|--------------|
 | **Full** (13) | Python · TypeScript · JavaScript · Svelte · Vue · Java · Kotlin · Go · Rust · C++ · C# · Scala · Ruby | The whole pipeline: AST symbols, import resolution, a resolved call graph, heritage, docstrings, framework edges, **and code-health markers** |
 | **Good** (5) | C · Swift · PHP · Dart · Object Pascal | Everything above except the full health suite. Dart and Object Pascal *do* get health markers; C, Swift and PHP don't yet |
-| **Partial** (1) | Luau / Roblox | AST symbols and `require()` resolution (Rojo / `.luaurc` aware). No health markers yet |
+| **Partial** (2) | Luau / Roblox · BYOND Dream Maker | AST symbols and project-aware import/include resolution. No health markers yet |
 | | | ⎯⎯ *tree-sitter parsing stops here. The rungs below are derived from git and imports, not from an AST.* ⎯⎯ |
 | **Lightweight** (7) | Elixir · Clojure · Haskell · Lean 4 · Erlang · F# · HTML | A real file-to-file import graph, no symbol-level claims |
 | **Structural** (9) | Objective-C · R · Zig · Julia · Elm · OCaml · Crystal · Nim · D | Git history only: blame, hotspots, co-change. No AST parsing |
 
-The first three rungs are the **19 languages parsed to a full AST**; all five are
-the **35** on the ladder. Both numbers are worth stating and neither is worth
+The first three rungs are the **20 languages parsed to a full AST**; all five are
+the **36** on the ladder. Both numbers are worth stating and neither is worth
 stating alone, so if you only take one thing from this page, take the rung your
 language sits on rather than either count.
 
@@ -245,6 +246,15 @@ bindings and heritage, with a dedicated workspace resolver per language.
 
 ---
 
+## Partial tier
+
+| Language | Extensions | Import resolution |
+|----------|------------|-------------------|
+| **Luau / Roblox** | `.lua` `.luau` | `require()` resolution with Rojo and `.luaurc` awareness |
+| **BYOND Dream Maker** | `.dm` `.dme` | `#include` paths from source and project files, including the backslash-separated paths emitted by Dream Maker. Extracts type paths, procs, overrides, globals and macros. `.dmf` interface files are indexed as passthrough configuration. Call edges remain disabled until they have a DM-specific resolver; the grammar is error-tolerant, so unsupported legacy syntax may reduce symbol coverage without dropping the file |
+
+---
+
 ## Beyond code files
 
 ### SQL + dbt
@@ -304,8 +314,8 @@ reachable is not statically decidable.
 
 ### Config and data
 
-OpenAPI, Protobuf, GraphQL, Dockerfile, Makefile, YAML, JSON, TOML, Terraform and
-Markdown appear in the file tree and the wiki, with special handlers extracting
+OpenAPI, Protobuf, GraphQL, Dockerfile, Makefile, YAML, JSON, TOML, Terraform,
+BYOND `.dmf` interfaces and Markdown appear in the file tree and the wiki, with special handlers extracting
 endpoints and targets where applicable.
 
 ---
