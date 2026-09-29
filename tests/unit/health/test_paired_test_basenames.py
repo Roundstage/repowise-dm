@@ -25,6 +25,7 @@ def _reference_has_paired_test_file(rel_path: str, all_paths: set[str]) -> bool:
     candidates = {
         f"test_{stem}.py",
         f"{stem}_test.py",
+        f"{stem}_spec.rb",
         f"{stem}.test.ts",
         f"{stem}.test.tsx",
         f"{stem}.test.js",
@@ -104,7 +105,6 @@ class TestPairedTestBasenames:
         assert _path_basenames(set()) == set()
         assert not _has_paired_test_file("anything.py", set())
 
-
 class TestPascalPairing:
     """Delphi/FPC's ``u``-prefixed unit pairs with a standalone console test
     program named ``Test<Stem>.dpr`` (the ``u`` dropped) -- confirmed against
@@ -141,3 +141,35 @@ class TestPascalPairing:
         # up the Pascal Test<Stem>.dpr candidate.
         basenames = _path_basenames({"uKeymap.ts", "TestKeymap.dpr"})
         assert not _has_paired_test_file("uKeymap.ts", basenames)
+
+    def test_ruby_and_crystal_underscore_spec_pairing(self) -> None:
+        """Ruby's <stem>_spec.rb (and Crystal's <stem>_spec.cr) is a paired test (#1768)."""
+        ruby = {"spec/user_spec.rb"}
+        assert _has_paired_test_file("lib/user.rb", _path_basenames(ruby))
+        crystal = {"spec/user_spec.cr"}
+        assert _has_paired_test_file("src/user.cr", _path_basenames(crystal))
+        # Same stem, dot form, must NOT count for Ruby's underscore layout.
+        assert not _has_paired_test_file("lib/user.rb", _path_basenames({"spec/user.spec.rb"}))
+
+
+def test_name_match_tier_finds_tests_named_for_a_target_anywhere():
+    from repowise.core.analysis.test_reachability import tests_matching_by_name
+
+    tests = {"tests/unit/test_jira_links.py", "tests/app/test_jira_links.py", "web/a.test.ts"}
+    found = tests_matching_by_name(["app/jira_links.py", "web/a.ts", "app/none.py"], tests)
+
+    # Same name twice: the one whose directories mirror the target's leads.
+    assert found["app/jira_links.py"].tests == [
+        "tests/app/test_jira_links.py",
+        "tests/unit/test_jira_links.py",
+    ]
+    assert found["app/jira_links.py"].via == "name-match"
+    assert found["web/a.ts"].total == 1
+    assert "app/none.py" not in found
+
+
+def test_unnamed_tests_rank_by_the_directories_they_share_with_the_target():
+    from repowise.core.analysis.test_reachability import rank_tests
+
+    ranked = rank_tests("pkg/a/b/mod.py", ["pkg/x/test_other.py", "pkg/a/b/test_sibling.py"])
+    assert ranked == ["pkg/a/b/test_sibling.py", "pkg/x/test_other.py"]

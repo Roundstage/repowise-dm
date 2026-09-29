@@ -14,7 +14,6 @@ co_change_partners_json field stored in git_metadata rows.
 
 from __future__ import annotations
 
-import json
 import math
 import os
 from collections import Counter, defaultdict
@@ -25,6 +24,7 @@ from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from repowise.core.analysis.risk_semantics import structural_impact_contract
+from repowise.core.co_change import parse_partners
 from repowise.core.exclusion import build_exclude_spec, is_excluded
 from repowise.core.ingestion.models import FILE_DEPENDENCY_EDGE_TYPES
 from repowise.core.persistence.models import GitMetadata, GraphNode, Repository
@@ -201,6 +201,8 @@ class PRBlastRadiusAnalyzer:
             meta = meta_by_path.get(path)
             node = node_by_path.get(path)
             temporal = float(getattr(meta, "temporal_hotspot_score", 0.0) or 0.0)
+            churn_pct = float(getattr(meta, "churn_percentile", 0.0) or 0.0)
+            hotspot = bool(getattr(meta, "is_hotspot", False))
             centrality = float(getattr(node, "pagerank", 0.0) or 0.0)
             structural_score = self._score_file(temporal, centrality)
             results.append(
@@ -210,6 +212,11 @@ class PRBlastRadiusAnalyzer:
                     # Compatibility alias for pre-semantics clients.
                     "risk_score": round(structural_score, 4),
                     "temporal_hotspot": round(temporal, 4),
+                    "churn_percentile": round(churn_pct, 4),
+                    # Published so a consumer stops re-deriving it from the
+                    # churn conjunct alone, which on a dormant repository is
+                    # just its top quartile.
+                    "is_hotspot": hotspot,
                     "centrality": round(centrality, 6),
                 }
             )
@@ -219,7 +226,20 @@ class PRBlastRadiusAnalyzer:
 
     @staticmethod
     def _score_file(temporal_hotspot_score: float, centrality: float) -> float:
-        """Compute file-level risk: centrality * (1 + temporal_hotspot_score)."""
+        """Compute file-level risk: centrality * (1 + temporal_hotspot_score).
+
+        Both inputs are repo-coupled -- the multiplier grows with commit
+        velocity, and pagerank sums to 1 so mean centrality is ``1/file_count``
+        -- so the score compares files within one change set and nothing across
+        repositories.
+
+        Substituting ``churn_percentile`` here was measured on 397 merged PRs
+        and rejected: it moved every moderate-band PR into localized, because a
+        bounded [1, 2] multiplier collapses an exponential tuned against an
+        unbounded one, and re-tuning that exponent would fit the constant to
+        this repository's file count. The rank is published beside the raw
+        value instead.
+        """
         return centrality * (1.0 + temporal_hotspot_score)
 
     async def _transitive_affected(
@@ -318,11 +338,9 @@ class PRBlastRadiusAnalyzer:
 
         warnings = []
         for meta in res.scalars().all():
-            partners = json.loads(meta.co_change_partners_json or "[]")
-            for partner in partners:
-                partner_path = partner.get("file_path") or partner.get("path") or ""
-                score = float(partner.get("co_change_count") or partner.get("count") or 0)
-                if partner_path and partner_path not in changed_set:
+            for partner in parse_partners(meta.co_change_partners_json):
+                partner_path, score = partner.file_path, partner.weight
+                if partner_path not in changed_set:
                     warnings.append(
                         {
                             "changed": meta.file_path,
@@ -332,11 +350,7 @@ class PRBlastRadiusAnalyzer:
                             "direction": "undirected",
                             "evidence_kind": "historical",
                             "provenance": "git_history",
-                            **(
-                                {"support": partner["frequency"]}
-                                if partner.get("frequency") is not None
-                                else {}
-                            ),
+                            **({"support": partner.support} if partner.support else {}),
                         }
                     )
 

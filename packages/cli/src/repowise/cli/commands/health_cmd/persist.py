@@ -7,7 +7,6 @@ per-test map. A ``repowise health`` run must not overwrite that data.
 
 from __future__ import annotations
 
-import json
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
@@ -30,7 +29,7 @@ def _load_persisted_coverage_map(repo_path: object) -> dict[str, dict]:
     )
     from repowise.core.persistence.crud import (
         get_repository_by_path,
-        load_coverage_for_repo,
+        load_coverage_map,
     )
 
     async def _do() -> dict[str, dict]:
@@ -44,21 +43,7 @@ def _load_persisted_coverage_map(repo_path: object) -> dict[str, dict]:
             repo = await get_repository_by_path(session, str(repo_path))
             if repo is None:
                 return {}
-            rows = await load_coverage_for_repo(session, repo.id)
-            out: dict[str, dict] = {}
-            for r in rows:
-                try:
-                    covered = list(json.loads(r.covered_lines_json))
-                except (ValueError, TypeError):
-                    covered = []
-                out[r.file_path] = {
-                    "line_coverage_pct": r.line_coverage_pct,
-                    "branch_coverage_pct": r.branch_coverage_pct,
-                    "covered_lines": covered,
-                    "total_coverable_lines": r.total_coverable_lines,
-                    "source_format": r.source_format,
-                }
-            return out
+            return await load_coverage_map(session, repo.id)
 
     try:
         return run_async(_do())
@@ -129,6 +114,7 @@ def _persist_health(repo_path: object, *, report: object) -> None:
         save_health_metrics,
         save_health_snapshot,
     )
+    from repowise.core.workspace.update import get_head_commit
 
     async def _do() -> None:
         url = get_db_url_for_repo(repo_path)
@@ -145,7 +131,12 @@ def _persist_health(repo_path: object, *, report: object) -> None:
                 return
             repo_id = repo.id
 
-            await save_health_metrics(session, repo_id, list(getattr(report, "metrics", []) or []))
+            await save_health_metrics(
+                session,
+                repo_id,
+                list(getattr(report, "metrics", []) or []),
+                analyzed_commit=get_head_commit(repo_path),
+            )
             findings = list(getattr(report, "findings", []) or [])
             if findings:
                 await save_health_findings(session, repo_id, findings)
@@ -163,6 +154,10 @@ def _persist_health(repo_path: object, *, report: object) -> None:
                     worst_performer_score=kpis.get("worst_performer_score"),
                     per_file_scores=scores_map,
                     per_file_deductions=deductions_map,
+                    structure_average=kpis.get("structure_average"),
+                    history_average=kpis.get("history_average"),
+                    production_average=kpis.get("production_average"),
+                    maintainability_average=kpis.get("maintainability_average"),
                 )
             except Exception as exc:
                 console.print(f"[yellow]Snapshot write skipped: {exc}[/yellow]")

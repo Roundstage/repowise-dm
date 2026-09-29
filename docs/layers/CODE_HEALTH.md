@@ -74,17 +74,18 @@ per-line blame index built for every file.
 
 ## The markers, and what each is allowed to do
 
-Repowise ships **49 registered detectors (52 marker ids)**, but only **26 are
+Repowise ships **51 registered detectors (54 marker ids)**, but only **25 are
 permitted to move the headline number**. That restriction is deliberate: the
 defect score carries published accuracy claims, so only markers that earned
 their weight against a bug corpus may affect it.
 
 | Tier | Markers | What it may do |
 |---|---:|---|
-| **Defect-scoring** | **26** | Calibrated weights; moves the 1-10 score |
+| **Defect-scoring** | **25** | Calibrated weights; moves the 1-10 score |
 | **Performance** | **20** | Own pillar, own cap; never touches the defect score |
 | **Maintainability-only (SQL)** | **3** | Maintainability only |
 | **Governance** | **3** | Surfaces as a finding; never deducts |
+| **Advisory** | **3** | Measured and reported; never deducts, and stays out of impact-ranked lists unless asked for |
 
 Nothing is inert, but "doesn't move the number" means three different things:
 
@@ -133,7 +134,7 @@ capped per category, so no single category can dominate:
 
 | Category | Cap |
 |---|---|
-| Organizational | −3.5 |
+| Organizational | −3.5, less on cleaner code (below) |
 | Structural complexity | −2.5 |
 | Test coverage | −2.0 |
 | Test coverage gradient | −2.0 |
@@ -147,27 +148,89 @@ rather than truncated, so each finding's reported impact stays linear and
 attributable — you can always explain exactly why a file scored what it scored.
 The final score is clamped to `[1.0, 10.0]`.
 
+**Organizational is the largest cap, and it is the git-derived one.** Churn,
+ownership, co-change, congestion and prior fixes describe what a file has been
+*through*, not what its code is like — and they rise as a file is worked on. So
+a week of genuine refactoring can lower a file's structural deduction while its
+history deduction climbs, and the headline barely moves. Each file therefore
+stores its deduction as two numbers, `structure_deduction` and
+`history_deduction`, which sum to the total. Nothing is hidden: the split is on
+every metric row, and the Counts control below reads it back.
+
+Git history on its own measures activity, so its cap follows the code: history
+can cost a file at most 1.0, plus one point for each point the other categories
+deduct, up to 3.5. A file with no code-shape finding never reads below 9.0 from
+history alone.
+
 Three repo-level KPIs: **Hotspot Health** (NLOC-weighted average over files the
 git layer classifies as hotspots), **Average Health** (NLOC-weighted over all
 files), and **Worst Performer**.
 
 ### Bands
 
-| Band | Score | Meaning |
-|---|---|---|
-| **Healthy** | `≥ 8.0` | Low-risk, maintainable |
-| **Warning** | `4.0 – 8.0` | Rising complexity or process risk |
-| **Alert** | `< 4.0` | High-risk; concentrates defects |
+| Band | Score | Colour | Meaning |
+|---|---|---|---|
+| **Excellent** | `≥ 8.5` | green | Low-risk, maintainable |
+| **Good** | `7.0 – 8.5` | green | Sound; nothing demanding attention |
+| **Fair** | `5.5 – 7.0` | gold | Rising complexity or process risk |
+| **Needs work** | `4.0 – 5.5` | amber | Worth scheduling |
+| **At risk** | `< 4.0` | red | High-risk; concentrates defects |
 
-The cutoffs are empirical, not arbitrary. On the 2,770-file measured corpus,
-Alert files carry **16.9× the per-file defect rate of Healthy files**
-(95% CI 8.6–29.0), and **2.18×** the defects-per-KLOC once file size is
-normalized out (95% CI 1.00–3.58). Both numbers belong together: the raw ratio
-is the headline, and the size-normalized one is the proof it is not simply an
-artifact of large files being large.
+The bands are **absolute, not percentile**, so a score means the same thing
+behind a firewall as it does against a public corpus. Excellent and Good share
+one green and are told apart by the word; green starts at 7.0 because a 7 is
+not a warning.
+
+The `4.0` cutoff is the empirical one and it has never moved. On the 2,770-file
+measured corpus, files below it carry **16.9× the per-file defect rate of files
+at 8.0 and above** (95% CI 8.6–29.0), and **2.18×** the defects-per-KLOC once
+file size is normalized out (95% CI 1.00–3.58). Both numbers belong together:
+the raw ratio is the headline, and the size-normalized one is the proof it is
+not simply an artifact of large files being large. The boundaries above 4.0 are
+reading points on that same scale rather than separate defect-rate claims.
+
+`8.0` survives as `TARGET_SCORE`, the score a refactoring's leverage is
+measured against. It is deliberately not a band edge — moving it would reorder
+every recommendation.
 
 The bands are defined once in core (`analysis/health/grading.py`) and mirrored
 in `@repowise-dev/types`, with a parity test on each side.
+
+### What the score counts
+
+Two controls decide which files a figure describes and which half of the
+deduction it counts. Both reach the CLI, MCP and every page, and both are
+echoed on the response, so a number always states what it is.
+
+| Control | Values | What it does |
+|---|---|---|
+| **Scope** | `all` (default) · `production` | Which files are in the population. Non-code files are never scored. |
+| **Counts** | `everything` (default) · `code_shape` | Whether the git-derived half of the deduction counts. |
+
+```bash
+repowise health --scope production     # exclude tests
+repowise health --counts code_shape    # the code-shape reading
+```
+
+```python
+get_health(scope="production", counts="code_shape")
+```
+
+**`code_shape` answers "is my code getting better".** It subtracts
+`history_deduction` and rescores from what is left, so a week of refactoring
+shows up as the improvement it was rather than being masked by the churn that
+the work itself created. It is arithmetic over the two stored columns, not a
+second scoring pass: history findings are dropped rather than re-weighted, and
+a file with no stored split is reported in `unscored_files` rather than counted
+as a ten.
+
+**`production` lowers the headline**, which surprises people: test files
+generally score higher than the code they cover, so removing them removes the
+easy end of the distribution. Nothing was found; the population changed.
+
+`everything` remains the calibrated number every accuracy claim on this page is
+about, and the health badge always reports it — so a projected reading can
+never be mistaken for the published one.
 
 ## How the weights were calibrated
 
@@ -308,8 +371,8 @@ losses:
 
 - **AUC is not a win.** p = 0.054 is above 0.05. The correct statement is "at
   least as good, consistent small edge," not "significantly better."
-- **CodeScene's precision lead is a real design choice.** It flags **27** Alert
-  files where we flag **132**. That is a deliberately more conservative
+- **CodeScene's precision lead is a real design choice.** It flags **27** files
+  at its most severe level where we flag **132** At risk. That is a deliberately more conservative
   operating point: a short list a team will actually work through, traded
   against recall. If you want a handful of files to fix this quarter rather than
   the ranking that catches the most defects, that operating point is better, and
@@ -330,9 +393,10 @@ Reports:
 
 ## Three health signals: defect risk, maintainability, and performance
 
-The three signals are computed from the same marker stream by one shared scoring
-kernel against independent weight, category and cap tables. They are co-equal
-views, **never blended into a single number**.
+The three scored signals are computed from the same marker stream by one shared
+scoring kernel against independent weight, category and cap tables. They are
+co-equal views, **never blended into a single number**. A fourth dimension,
+`advisory`, carries markers that never score at all. See below.
 
 **Defect risk** is the calibrated headline: the number on the dashboard ring,
 the band, the badge, and every accuracy claim above.
@@ -358,6 +422,81 @@ Every finding carries a `dimension` naming its pillar, and all three surface
 identically: `summary.*_average` on the REST overview, `kpis.*` on MCP
 `get_health`, per-file scores on every metric row, and a line each in `CLAUDE.md`
 and `repowise status`.
+
+### The fourth dimension: `advisory`, which never scores
+
+Some things are worth measuring and impossible to calibrate. No defect corpus
+labels how much of a test is mock setup, so a mock-density marker has no
+calibration story and never will. Weighting it anyway would move a number that
+claims to predict bugs using evidence that says nothing about bugs.
+
+`advisory` is where those markers live. It is deliberately **not** one of the
+three scored dimensions: there is no weight table, category or cap keyed on it,
+so "never deducts" is structural rather than a promise. Its findings carry a
+`health_impact` of exactly `0.0`, are never counted in a change's
+introduced/worsened totals, and can never make a review verdict blocking.
+
+They are also out of every impact-ranked list, which is a statement about
+ranking rather than about existence: a zero-impact row appended to a list
+ordered by impact reads as a deduction that rounded away. Ask for the dimension
+and you get it, and a surface that ranks nothing -- one file's findings in an
+editor, or a list already filtered to one marker -- gets it without asking.
+
+| Marker | Languages | What it measures |
+|---|---|---|
+| `assertion_free_test` | Python · TypeScript / JavaScript | A test case that runs the code under test and checks nothing |
+| `mock_saturated_test` | Python · TypeScript / JavaScript | Mock-setup statements per assertion in a test function |
+| `hidden_coupling` | every language with git history | Files that change together with no import between them |
+
+`hidden_coupling` is here for the other reason: it was measured and carried no
+signal. Alone it ranks defect-prone files near chance (AUC about 0.55), and a
+pre-registered test on 12 repositories no earlier health study used found the
+score without it non-inferior at predicting defects, so it stopped deducting.
+
+A marker earns weight by clearing the house precision bar (roughly 70%
+hand-labelled) on a real corpus. `mock_saturated_test` has not, and precision is
+measured per language because it does not transfer: **67%** on Python (32
+findings) and **40%** on TypeScript (30 findings), each the complete population
+at the shipped gate. Both figures predate the assertion count gaining the
+oracle shapes listed in
+[LANGUAGE_SUPPORT.md](LANGUAGE_SUPPORT.md#code-health-coverage), which grew this
+marker's denominator on Python and TypeScript. A larger denominator lowers the
+ratio, so the change can only suppress findings, never add one — but the two
+numbers above were measured against the smaller denominator and are now a
+ceiling rather than a current reading.
+
+It stays advisory until two false-positive families are separated: value-object builders named `Fake*` passed as input to real logic, and
+boundary isolation where the assertion reads a real artifact. Both turn on
+whether an assertion observes a double or production output, which is a dataflow
+question the pass does not ask — and on the TypeScript sample that one question
+accounted for every false positive.
+
+`assertion_free_test` measures at least **71%** on TypeScript — a floor
+rather than a current reading, three false-positive families having been closed
+since the labelling (31 findings, the complete
+population of two corpora; an earlier pass published 51% for the larger
+pre-change population, which re-labels to 43.1% against this rubric) and **86%** on Python (29 hand-labelled, a systematic
+sample of 172), and does not report on Go or Java at all; the per-language
+reasoning is in
+[LANGUAGE_SUPPORT.md](LANGUAGE_SUPPORT.md#code-health-coverage). A test that
+delegates its oracle to a helper is resolved in the same file by name, and in
+another file when the call graph binds the call, which is what closed most of
+the TypeScript gap. The marker stays advisory on both: neither population is large
+enough to settle the bar.
+
+It asks a question with a yes-or-no answer rather than a
+threshold, which is why it can be stated plainly: a test case with no oracle of
+any kind — no assertion, no mock verification, no `raise`/`throw` the author
+wrote by hand, and no call to an assertion helper from a position the statement
+scan cannot classify. Four questions, every one of them yes or no and none of
+them a threshold. A **mock verification counts as an
+assertion here**, the opposite of the marker above it, because a test whose only
+oracle is `verify(...)` does check something. The two markers read the same call
+for two different questions; the tiers that keep them apart are in
+`complexity/assertions.py`.
+
+Per-language coverage, and why Go and Java are blocked for each marker:
+[LANGUAGE_SUPPORT.md](LANGUAGE_SUPPORT.md#code-health-coverage).
 
 ## Performance risk
 
@@ -405,6 +544,27 @@ round-trip, it does not claim the work is avoidable. Database and network
 findings are usually batchable; filesystem ones often are not, since deleting N
 files genuinely needs N unlinks. The finding still tells you where the time
 goes.
+
+A few more things keep the plans honest:
+
+- **Proven means the transformation, not the runtime.** Parallelizing awaits
+  against a database or network client is advisory with a
+  `bounded_concurrency` prerequisite, however clean the dataflow. A loop that
+  already walks its input in chunks (`range(0, n, CHUNK)`, `batched(...)`) is
+  reported as `loop_already_chunked` rather than told to batch.
+- **One line, one problem.** When `io_in_loop` and `serial_await_in_loop` fire
+  on the same call, each names the other in `siblings`, and batching is queued
+  right before the parallelize variant.
+- **Plans carry steps and validation.** Each performance plan lists its edits
+  (`mechanical` only when the strategy is proven) and the tests that validate
+  it: coverage, then call graph, then import graph, then a test named for the
+  file (`via: "name-match"`).
+
+**Over-fetch.** `unbounded_read_reduced_in_memory` (Python, advisory) flags a
+query with no limit or aggregate whose rows are then deduplicated per key in
+code, in the same function or one same-file helper. It is the one shape here
+that is not a loop around I/O: the query runs once and returns too much, and
+the fix is to select one row per key in the database.
 
 Methodology and raw data:
 [perf-detection](https://github.com/repowise-dev/repowise-bench/tree/master/perf-detection).
@@ -475,7 +635,8 @@ repowise health --trend
 ```
 
 Coverage reports light up the test-coverage markers. **LCOV**, **Cobertura**,
-**Clover** and a normalized JSON format are auto-detected:
+**Clover**, **JaCoCo**, **Go coverprofile** and a normalized JSON format are
+auto-detected:
 
 ```bash
 pytest --cov --cov-report=lcov:coverage.lcov
@@ -512,41 +673,13 @@ never silently change what those numbers mean.
 `repowise update` re-scores only changed files. Findings and metrics for
 unchanged files stay put; no nightly full re-index.
 
-## Comparison
-
-The honest dividing line: each tool below has a rules engine and a definitional
-rating. Repowise predicts which files harbor the next bug and validates that
-forward in time against a labeled corpus.
-
-| Capability | Repowise | CodeScene | SonarQube | Qlty¹ | Codacy |
-|---|---|---|---|---|---|
-| Per-file health score | ✅ 1-10 | ✅ 1-10 | ⚠️ A-E from rule counts | ✅ A-F | ✅ A-F |
-| Score uses git / behavioral signals | ✅ | ✅ its core | ❌ static rules only | ⚠️ churn vs complexity | ❌ |
-| Cross-file / call-graph analysis | ✅ interprocedural | ⚠️ git temporal coupling | ⚠️ taint, security only | ❌ file-local | ❌ file-local |
-| Defect-validated against a bug corpus | ✅ AUC 0.737, held-out 0.76-0.78 | ⚠️ "Code Red" study, no per-file AUC | ❌ | ❌ | ❌ |
-| Static performance risk across the call graph | ✅ | ❌ | ❌ | ❌ | ❌ |
-| Test-coverage ingestion | ✅ | ✅ | ⚠️ imports reports | ✅ | ✅ |
-| Cross-file refactoring plans | ✅ + opt-in codegen | ⚠️ 5 in-function smells | ❌ | ❌ | ❌ |
-| Trend tracking + declining alerts | ✅ | ✅ | ✅ quality gates | ✅ | ✅ |
-| MCP / agent integration | ✅ | ✅ | ✅ | ❌ | ✅ |
-| Security scanning | ⚠️ separate layer | ⚠️ secondary | ✅ strong | ❌ | ✅ full suite |
-| License | ✅ AGPL-3.0 | ⚠️ proprietary, on-prem Docker | ⚠️ Community free, paid by LOC | ⚠️ free OSS, paid teams | ⚠️ free OSS, paid per dev |
-
-¹ Code Climate Quality was spun out as Qlty Software in November 2024.
-
-**What each does that we do not.** **SonarQube** has the broadest security
-scanning, the widest language coverage, and the most adopted merge-gate model.
-**CodeScene** is the most mature behavioral-analysis product — knowledge maps,
-off-boarding simulation, 28+ languages — and holds the only published business-
-impact study in this group, which we could not replicate on open data.
-**Qlty** defined the churn-vs-complexity quadrant. **Codacy** has the widest
-security suite of the four and polished PR automation.
-
 ## See also
 
 - [`docs/architecture/code-health.md`](../architecture/code-health.md): internals,
   the full marker roster, and the complete weight tables.
 - [`docs/BENCHMARKS.md`](../BENCHMARKS.md): every published number with its
   sample size and test.
+- [DOC_DRIFT.md](DOC_DRIFT.md): the other thing this layer checks, your own
+  documentation against the tree.
 - [REFACTORING.md](REFACTORING.md) · [TEST_INTELLIGENCE.md](TEST_INTELLIGENCE.md) ·
   [BUG_HISTORY.md](BUG_HISTORY.md)

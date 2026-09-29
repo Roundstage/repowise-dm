@@ -16,18 +16,26 @@ from typing import Any, Literal
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from repowise.core.analysis.health.grading import HEALTHY_MIN
-from repowise.core.analysis.test_reachability import ReachedBy, tests_reaching_by_tier
+from repowise.core.analysis.health.grading import TARGET_SCORE
+from repowise.core.analysis.test_reachability import (
+    ReachedBy,
+    load_test_files,
+    rank_tests,
+    tests_matching_by_name,
+    tests_reaching_by_tier,
+)
 
 from .models import RefactoringSuggestion
 
 RecommendationView = Literal["canonical", "file_spread"]
 ValidationBasis = Literal["measured", "inferred", "mixed", "unknown"]
-ValidationVia = Literal["coverage", "call-graph", "import-graph", "mixed"]
+ValidationVia = Literal["coverage", "call-graph", "import-graph", "name-match", "mixed"]
 
 DEFAULT_TEST_LIMIT = 12
-_EFFORT_COST = {"S": 1.0, "M": 2.0, "L": 3.0, "XL": 5.0}
-_CONFIDENCE_RISK = {"high": 0.0, "medium": 0.5, "low": 1.25}
+# Public because the opportunity rank charges the same work and the same
+# uncertainty over a whole step set. Two tables would be two policies.
+EFFORT_COST = {"S": 1.0, "M": 2.0, "L": 3.0, "XL": 5.0}
+CONFIDENCE_RISK = {"high": 0.0, "medium": 0.5, "low": 1.25}
 _WEAK_PROVENANCE = {"name-fallback", "global_unique", "unknown"}
 
 
@@ -166,6 +174,28 @@ def enrich_blast_radius(suggestion: RefactoringSuggestion, centrality: Mapping[s
     suggestion.blast_radius = blast
 
 
+def surface_confidence_risk(surface: int, confidence: str) -> float:
+    """Risk from change surface and detector certainty, charged once.
+
+    Both the plan rank and the opportunity rank ask this, over their own
+    surface: one plan's blast radius, or the union across a step set. Two
+    copies would be two policies about the same two inputs.
+    """
+    return math.log1p(max(0, surface)) + CONFIDENCE_RISK.get(confidence, 0.75)
+
+
+def priority_score(*, benefit: float, uplift: float, cost: float, risk: float) -> float:
+    """Benefit scaled by what makes it attractive, over what it costs.
+
+    Benefit multiplies rather than offsets, so something with no evidence of a
+    gain scores zero and cannot be lifted above something that recovers health
+    by being popular, cheap or easy. What counts as benefit and what counts as
+    uplift differ between a plan and a composed opportunity, and are decided by
+    their own owners; this shape is the part they share.
+    """
+    return benefit * (1.0 + uplift) / (1.0 + cost + risk)
+
+
 def _performance_benefit(evidence: Mapping[str, Any]) -> float:
     factors = evidence.get("rank_factors")
     if isinstance(factors, Mapping):
@@ -215,9 +245,10 @@ def detector_native_benefit(suggestion: RefactoringSuggestion) -> float:
     benefit = _DETECTOR_BENEFIT.get(suggestion.refactoring_type)
     if benefit is not None:
         return benefit(suggestion.evidence or {})
-    # A detector that emitted a concrete graph-native plan has a real but
-    # deliberately small gain even when it is not a defect-health deduction.
-    return 1.0 if suggestion.refactoring_type else 0.0
+    # No health deduction and no detector-native measure: there is no
+    # evidence of a gain, and a flat placeholder is what let zero-impact clones
+    # in popular files lead the board. Report the absence.
+    return 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -350,7 +381,7 @@ def _validation_target(
         identities_complete = (
             reached is None or reached.all_tests is not None or total == len(labels)
         )
-    ordered = sorted(labels)
+    ordered = rank_tests(file_path, labels)
     return (
         ValidationTarget(
             file_path=file_path,
@@ -375,13 +406,13 @@ def build_validation_plan(
     """Resolve target evidence in strict measured/call/import precedence."""
     cap = max(0, test_limit)
     target_rows: list[ValidationTarget] = []
-    union: set[str] = set()
+    ranked: dict[str, None] = {}
     identities_complete = True
     for file_path, lines in sorted(_line_ranges(suggestion).items()):
         target, labels, target_complete = _validation_target(
             file_path, lines, measured, inferred, cap
         )
-        union.update(labels)
+        ranked.update(dict.fromkeys(rank_tests(file_path, labels)))
         identities_complete = identities_complete and target_complete
         target_rows.append(target)
 
@@ -394,7 +425,7 @@ def build_validation_plan(
     aggregate_via: ValidationVia | None = (
         None if not vias else next(iter(vias)) if len(vias) == 1 else "mixed"
     )
-    ordered_tests = sorted(union)
+    ordered_tests = list(ranked)
     aggregate_total = (
         len(ordered_tests)
         if identities_complete
@@ -469,27 +500,28 @@ def _priority_components(
     dependents: int,
     validation: ValidationPlan,
 ) -> tuple[float, float, float, float, float, int]:
-    weighted_deficit = round(max(HEALTHY_MIN - health_score, 0.0) * max(nloc, 1))
+    weighted_deficit = round(max(TARGET_SCORE - health_score, 0.0) * max(nloc, 1))
     benefit = detector_native_benefit(suggestion)
     entry_bonus = 0.5 if (suggestion.evidence or {}).get("reliable_entry_reachability") else 0.0
     leverage = 0.5 * math.log1p(weighted_deficit) + math.log1p(max(0, dependents)) + entry_bonus
     surface = max(blast_size(suggestion), max(0, len(affected_files(suggestion)) - 1))
-    cost = _EFFORT_COST.get(suggestion.effort_bucket, 3.0) + math.log1p(surface)
+    # Blast radius is charged once, in ``risk``. Cost is the work itself.
+    cost = EFFORT_COST.get(suggestion.effort_bucket, 3.0)
     provenance = str((suggestion.evidence or {}).get("provenance") or "")
     weak_graph = 1.0 if provenance in _WEAK_PROVENANCE else 0.0
-    validation_risk = {
-        "measured": 0.0,
-        "mixed": 0.5,
-        "inferred": 0.75,
-        "unknown": 1.5,
-    }[validation.basis]
-    risk = (
-        math.log1p(surface)
-        + _CONFIDENCE_RISK.get(suggestion.confidence, 0.75)
-        + weak_graph
-        + validation_risk
+    # A test named for the file, with no edge proving it runs it, is weaker
+    # evidence than a graph walk; price it between inferred and unknown.
+    validation_risk = (
+        1.0
+        if validation.via == "name-match"
+        else {"measured": 0.0, "mixed": 0.5, "inferred": 0.75, "unknown": 1.5}[validation.basis]
     )
-    priority = (1.0 + benefit) * (1.0 + leverage) / (1.0 + cost + risk)
+    risk = surface_confidence_risk(surface, suggestion.confidence) + weak_graph + validation_risk
+    # Benefit multiplies rather than offsets: leverage (the host file's
+    # deficit and dependents) scales a real gain, and scales nothing when
+    # there is none. A plan with no evidence of benefit scores 0 and cannot
+    # outrank one that recovers health, however popular its file.
+    priority = priority_score(benefit=benefit, uplift=leverage, cost=cost, risk=risk)
     return (
         round(benefit, 4),
         round(leverage, 4),
@@ -517,8 +549,8 @@ def build_recommendations(
         enrich_blast_radius(suggestion, centrality)
         metric = metrics.get(suggestion.file_path)
         nloc = int(_attr(metric, "nloc", 0) or 0)
-        raw_health_score = _attr(metric, "score", HEALTHY_MIN)
-        health_score = float(HEALTHY_MIN if raw_health_score is None else raw_health_score)
+        raw_health_score = _attr(metric, "score", TARGET_SCORE)
+        health_score = float(TARGET_SCORE if raw_health_score is None else raw_health_score)
         dependents = int(float(centrality.get(suggestion.file_path, 0.0) or 0.0))
         validation = validations.get(index) or build_validation_plan(suggestion, {}, {})
         benefit, leverage, cost, risk, rank_score, deficit = _priority_components(
@@ -627,6 +659,11 @@ async def hydrate_recommendations(
         if unanswered
         else {}
     )
+    unreached = sorted(unanswered - inferred.keys())
+    if unreached:
+        inferred.update(
+            tests_matching_by_name(unreached, await load_test_files(session, repository_id))
+        )
     validations = {
         index: build_validation_plan(suggestion, measured, inferred, test_limit=test_limit)
         for index, suggestion in enumerate(suggestions)
@@ -647,7 +684,9 @@ def serialize_recommendations(
 
 
 __all__ = [
+    "CONFIDENCE_RISK",
     "DEFAULT_TEST_LIMIT",
+    "EFFORT_COST",
     "Recommendation",
     "RecommendationView",
     "ValidationPlan",
@@ -662,6 +701,8 @@ __all__ = [
     "detector_native_benefit",
     "enrich_blast_radius",
     "hydrate_recommendations",
+    "priority_score",
     "rehydrate_suggestion",
     "serialize_recommendations",
+    "surface_confidence_risk",
 ]

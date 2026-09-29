@@ -81,6 +81,56 @@ async def _seed_page(page_id, target_path, page_type="file_page"):
         await session.commit()
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("glob", ["*", "?"])
+async def test_path_search_accepts_trailing_glob(setup_mcp, glob):
+    """A trailing glob narrows a path search without becoming a literal."""
+    import types
+
+    import repowise.server.mcp_server as mcp_mod
+    from repowise.server.mcp_server.tool_search_symbols import search_paths_single
+
+    await _seed_page("file_page:tool_overview.py", "packages/server/tool_overview.py")
+    await _seed_page("file_page:tool_answer.py", "packages/server/tool_answer.py")
+
+    ctx = types.SimpleNamespace(
+        session_factory=mcp_mod._session_factory,
+        path="/tmp/test-repo",
+    )
+    result = await search_paths_single(ctx, f"tool_overview{glob}", limit=10)
+
+    assert [item["file"] for item in result] == ["packages/server/tool_overview.py"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("query", "expected"),
+    [
+        ("tool_overview.py", ["packages/server/tool_overview.py"]),
+        ("  *tool_overview?  ", ["packages/server/tool_overview.py"]),
+        ("*", []),
+        ("?", []),
+        ("tool_*_overview", []),
+    ],
+)
+async def test_path_search_preserves_non_trailing_glob_behavior(setup_mcp, query, expected):
+    """Only boundary glob markers are supported by path-mode substring search."""
+    import types
+
+    import repowise.server.mcp_server as mcp_mod
+    from repowise.server.mcp_server.tool_search_symbols import search_paths_single
+
+    await _seed_page("file_page:tool_overview.py", "packages/server/tool_overview.py")
+
+    ctx = types.SimpleNamespace(
+        session_factory=mcp_mod._session_factory,
+        path="/tmp/test-repo",
+    )
+    result = await search_paths_single(ctx, query, limit=10)
+
+    assert [item["file"] for item in result] == expected
+
+
 class TestDecisionDownweight:
     """Decision records must not crowd file pages out of the top ranks."""
 
@@ -1192,3 +1242,80 @@ class TestSearchCandidates:
         mcp_mod._vector_store.search = fake_search
         result = await search_codebase("what is this repository", limit=10)
         assert "candidates" not in result
+
+
+async def test_an_exact_name_outranks_a_crowd_of_substring_neighbours(
+    session, populated_db, setup_mcp
+) -> None:
+    """Exact-match protection is three mechanisms deep; this pins the result.
+
+    The SQL candidate query front-loads exact name matches so the 400-row
+    candidate cap cannot evict them, `_score_symbol` adds 100 for an exact name
+    against a non-exact ceiling near 67, and `_protect_exact_symbols` partitions
+    the survivor to the head before the cut to `limit`. Each layer is unit
+    tested; none of them pins the outcome the caller actually sees when the
+    fuzzy neighbours outnumber the result window several times over.
+
+    So the crowd here is built to win if anything can: thirty substring matches,
+    every one of them carrying maximal graph centrality and an entry-point flag,
+    against one exact match with no graph node at all and a path that sorts
+    last.
+    """
+    from repowise.core.persistence.models import GraphNode, WikiSymbol
+    from repowise.server.mcp_server.tool_search import search_codebase
+
+    rid = populated_db
+    for i in range(30):
+        name = f"load_from_source_{i:02d}"
+        path = f"src/n{i:02d}.py"
+        session.add(
+            WikiSymbol(
+                id=f"crowd-{i}",
+                repository_id=rid,
+                file_path=path,
+                symbol_id=f"{path}::{name}",
+                name=name,
+                qualified_name=name,
+                kind="function",
+                signature=f"def {name}()",
+                start_line=1,
+                end_line=5,
+                language="python",
+            )
+        )
+        session.add(
+            GraphNode(
+                id=f"crowd-n-{i}",
+                repository_id=rid,
+                node_id=f"{path}::{name}",
+                node_type="symbol",
+                name=name,
+                file_path=path,
+                language="python",
+                pagerank=0.9,
+                betweenness=0.9,
+                is_entry_point=True,
+            )
+        )
+    session.add(
+        WikiSymbol(
+            id="crowd-exact",
+            repository_id=rid,
+            file_path="src/zzz_last.py",
+            symbol_id="src/zzz_last.py::load",
+            name="load",
+            qualified_name="load",
+            kind="function",
+            signature="def load()",
+            start_line=1,
+            end_line=5,
+            language="python",
+        )
+    )
+    await session.commit()
+
+    res = await search_codebase(query="load", limit=5)
+
+    assert res["mode"] == "symbol"
+    assert res["exact_match"] is True
+    assert res["results"][0]["symbol_id"] == "src/zzz_last.py::load"

@@ -12,9 +12,14 @@ import pytest
 
 from repowise.core.analysis.health.complexity.languages import get_language_map
 from repowise.core.analysis.health.dataflow import analyze_file, find_extractions
+from repowise.core.analysis.health.models import Severity
 from repowise.core.analysis.health.refactoring import detect_refactorings
-from repowise.core.analysis.health.refactoring.extract_method import ExtractMethodDetector
+from repowise.core.analysis.health.refactoring.extract_method import (
+    ExtractMethodDetector,
+    _recovered_fraction,
+)
 from repowise.core.analysis.health.refactoring.models import RefactoringContext
+from repowise.core.analysis.health.scoring import severity_deduction
 
 # A long function whose tail (compute-average loop) is a clean extraction.
 _PROCESS = """
@@ -154,6 +159,8 @@ def _find_extractions_reference(analysis, lmap):
         Extraction,
         _all_blocks,
         _infer_in_out,
+    _loop_carry_free,
+    _outs_definitely_assigned,
         _sorted,
         _span_metrics,
         _unwrap_container,
@@ -185,7 +192,7 @@ def _find_extractions_reference(analysis, lmap):
 
     out = []
     evaluated = 0
-    for block in _all_blocks(fn_node, lmap.block_kinds, scope_kinds):
+    for block, loop in _all_blocks(fn_node, lmap.block_kinds, scope_kinds, lmap.loop_kinds):
         stmts = block.named_children
         n = len(stmts)
         is_body = block.id == body_container.id
@@ -216,6 +223,12 @@ def _find_extractions_reference(analysis, lmap):
                 e = span[-1].end_point[0] + 1
                 params, returns = _infer_in_out(def_lines, use_lines, s, e)
                 if len(params) > _MAX_PARAMS or len(returns) > _MAX_RETURNS:
+                    continue
+                if not _outs_definitely_assigned(span, returns, def_lines, lmap):
+                    continue
+                if loop is not None and not _loop_carry_free(
+                    span, loop, s, e, def_lines, use_lines, lmap
+                ):
                     continue
                 out.append(
                     Extraction(
@@ -386,14 +399,18 @@ def test_suggested_name_unit():
     assert name(_Analysis("process"), _Extraction(["average"])) == "compute_average"
     # Non-identifier characters normalised through the shared slug.
     assert name(_Analysis("p"), _Extraction(["total-count"])) == "compute_total_count"
-    # No single OUT -> fall back to the enclosing function, the only other
-    # anchor known for certain.
-    assert name(_Analysis("run_pipeline"), _Extraction([])) == "run_pipeline_helper"
-    assert name(_Analysis("run_pipeline"), _Extraction(["a", "b"])) == "run_pipeline_helper"
+    # No single OUT -> no anchor, so no name. The enclosing function's name
+    # described the span's context, never the span, and collided with every
+    # sibling plan in the file.
+    assert name(_Analysis("run_pipeline"), _Extraction([])) is None
+    assert name(_Analysis("run_pipeline"), _Extraction(["a", "b"])) is None
     # A return name that slugs to nothing must not yield "compute_".
-    assert name(_Analysis("process"), _Extraction(["___"])) == "process_helper"
-    # Nothing usable at all -> a stable, still-valid identifier.
-    assert name(_Analysis(""), _Extraction([])) == "extracted_helper"
+    assert name(_Analysis("process"), _Extraction(["___"])) is None
+    # An OUT named for its role, not the product: "compute_result" names
+    # nothing the reader did not already know.
+    assert name(_Analysis("process"), _Extraction(["result"])) is None
+    # Nothing usable at all -> no name at all.
+    assert name(_Analysis("___"), _Extraction([])) is None
 
 
 def test_detector_silent_without_matching_finding():
@@ -430,3 +447,61 @@ def test_detector_is_deterministic():
     first = run()
     for _ in range(3):
         assert run() == first
+
+
+# -- honest impact --------------------------------------------------------------
+
+
+@dataclass
+class _Shape:
+    ccn: int
+    nloc: int
+
+
+@dataclass
+class _Span:
+    ccn_removed: int
+    slice_nloc: int
+
+
+def test_extraction_that_clears_the_bar_recovers_the_whole_finding():
+    # CCN 12 -> 6 residual, helper CCN 7: both below complex_method's bar of 9.
+    assert _recovered_fraction("complex_method", _Shape(12, 40), _Span(6, 15)) == 1.0
+
+
+def test_extraction_that_only_drops_a_band_recovers_the_band_difference():
+    # CCN 15 (high) -> 12 (medium): still a complex method, one band lower.
+    got = _recovered_fraction("complex_method", _Shape(15, 40), _Span(3, 8))
+    expected = 1 - severity_deduction(Severity.MEDIUM) / severity_deduction(Severity.HIGH)
+    assert got == pytest.approx(expected)
+
+
+def test_extraction_that_stays_in_band_recovers_nothing():
+    # CCN 209 -> 203 stays critical for both brain_method and complex_method.
+    assert _recovered_fraction("brain_method", _Shape(209, 900), _Span(6, 20)) == 0.0
+    assert _recovered_fraction("complex_method", _Shape(209, 900), _Span(6, 20)) == 0.0
+
+
+def test_helper_that_inherits_the_smell_is_charged_against_the_recovery():
+    # 130-line method (high) lifts 100 lines out: the residual clears the bar
+    # but the helper is itself a 100-line large_method (medium).
+    got = _recovered_fraction("large_method", _Shape(12, 130), _Span(6, 100))
+    assert 0.0 < got < 1.0
+
+
+def test_detector_credits_only_what_the_best_extraction_recovers():
+    # The finding claims a CCN far above what _PROCESS's best span can clear,
+    # so the plan still stands but recovers nothing.
+    fns = _analyses(_PROCESS)
+    fn = fns[0]
+    fn.ccn, fn.nloc = 40, 18
+    ctx = RefactoringContext(
+        file_path="m.py",
+        language="python",
+        nloc=100,
+        findings=[_Finding("complex_method", "process", line_start=2, health_impact=2.0)],
+        function_analyses=[fn],
+    )
+    (s,) = ExtractMethodDetector().detect(ctx)
+    assert s.source_biomarker == "complex_method"
+    assert s.impact_delta == 0.0

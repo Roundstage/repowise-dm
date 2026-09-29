@@ -21,11 +21,30 @@ from repowise.cli.helpers import (
     run_async,
     save_state,
     validate_provider_config,
+    warn,
 )
 
 # ---------------------------------------------------------------------------
 # run_async
 # ---------------------------------------------------------------------------
+
+
+class TestWarn:
+    def test_warn_prints_warning_prefix_to_stderr(self, capsys):
+        warn("something went wrong")
+        captured = capsys.readouterr()
+        assert "Warning:" in captured.err
+        assert "something went wrong" in captured.err
+        # Nothing leaks to stdout.
+        assert captured.out == ""
+
+    def test_warn_prefix_rendered(self, capsys):
+        warn("boom")
+        captured = capsys.readouterr()
+        # Rich renders the [yellow] markup away when stderr isn't a tty, but the
+        # human-facing "Warning:" prefix must survive on the stderr stream.
+        assert captured.err.startswith("Warning: boom\n")
+        assert captured.out == ""
 
 
 class TestRunAsync:
@@ -658,6 +677,30 @@ class TestResolveProviderConfigModel:
         assert resolve_provider("openrouter", "anthropic/claude-opus-4", repo_path=tmp_path)
         assert captured["kwargs"].get("model") == "anthropic/claude-opus-4"
 
+    def test_env_model_used_when_set(self, monkeypatch, tmp_path):
+        captured = self._capture(monkeypatch, tmp_path, {})
+        monkeypatch.setenv("REPOWISE_PROVIDER", "openrouter")
+        monkeypatch.setenv("REPOWISE_MODEL", "anthropic/claude-sonnet-5")
+
+        assert resolve_provider(None, None, repo_path=tmp_path) == "provider"
+        assert captured["kwargs"].get("model") == "anthropic/claude-sonnet-5"
+
+    def test_env_model_overrides_config_model(self, monkeypatch, tmp_path):
+        captured = self._capture(monkeypatch, tmp_path, {"model": "google/gemini-3.1"})
+        monkeypatch.setenv("REPOWISE_PROVIDER", "openrouter")
+        monkeypatch.setenv("REPOWISE_MODEL", "anthropic/claude-opus-5")
+
+        assert resolve_provider(None, None, repo_path=tmp_path) == "provider"
+        assert captured["kwargs"].get("model") == "anthropic/claude-opus-5"
+
+    def test_explicit_model_flag_overrides_env_model(self, monkeypatch, tmp_path):
+        captured = self._capture(monkeypatch, tmp_path, {"model": "google/gemini-3.1"})
+        monkeypatch.setenv("REPOWISE_PROVIDER", "openrouter")
+        monkeypatch.setenv("REPOWISE_MODEL", "anthropic/claude-opus-5")
+
+        assert resolve_provider("openrouter", "openai/gpt-5.6-luna", repo_path=tmp_path) == "provider"
+        assert captured["kwargs"].get("model") == "openai/gpt-5.6-luna"
+
 
 # ---------------------------------------------------------------------------
 # Update queued / pending markers — coalescing primitives that prevent the
@@ -816,10 +859,50 @@ class TestResolveProviderOrPrompt:
             helpers.resolve_provider_or_prompt(None, None, tmp_path, interactive=False)
         assert called["prompt"] == 0
 
+    def test_explicit_provider_prompt_resolves_after_setup(self, tmp_path, monkeypatch):
+        """An explicit provider gets inline credential setup only when interactive."""
+        import click
+
+        from repowise.cli import helpers
+
+        sentinel = object()
+        calls = {"resolve": 0, "prompt": 0}
+
+        def _resolve(provider_name, model, repo_path=None):
+            calls["resolve"] += 1
+            if calls["resolve"] == 1:
+                raise click.ClickException("Provider 'openai' requires a key")
+            assert provider_name == "anthropic"
+            assert model == "ag/gemini-3.7-flash-medium"
+            assert repo_path == tmp_path
+            return sentinel
+
+        monkeypatch.setattr(helpers, "resolve_provider", _resolve)
+
+        def _credentials(console, provider, *, repo_path=None, save_key=True):
+            calls["prompt"] += 1
+            assert provider == "anthropic"
+            assert repo_path == tmp_path
+            assert save_key is True
+            return True
+
+        monkeypatch.setattr(
+            "repowise.cli.ui.provider_selection.interactive_provider_credentials",
+            _credentials,
+        )
+
+        result = helpers.resolve_explicit_provider_or_prompt(
+            "anthropic",
+            "ag/gemini-3.7-flash-medium",
+            tmp_path,
+            interactive=True,
+        )
+
+        assert result is sentinel
+        assert calls == {"resolve": 2, "prompt": 1}
+
     @pytest.mark.parametrize("exc_name", ["EOFError", "Abort"])
-    def test_unanswerable_prompt_falls_back_to_clean_error(
-        self, tmp_path, monkeypatch, exc_name
-    ):
+    def test_unanswerable_prompt_falls_back_to_clean_error(self, tmp_path, monkeypatch, exc_name):
         """A tty that lies: the prompt hits EOF/Abort, so we surface the clean
         actionable error instead of a bare 'Aborted!' — the agent-safe path."""
         import click

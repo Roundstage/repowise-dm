@@ -21,10 +21,13 @@
 import { useMemo, useState } from "react";
 import { ArrowUpRight, Sparkles } from "lucide-react";
 import useSWR from "swr";
+import { GOOD_MIN } from "@repowise-dev/types/health";
 import type {
   CoverageFileRow,
   HealthCoverageResponse,
   HealthFinding,
+  InferredTestMap,
+  ReachedFileRow,
 } from "@repowise-dev/types/health";
 
 import { Skeleton } from "../ui/skeleton";
@@ -48,6 +51,7 @@ import {
   type CoverageFilePromptInput,
 } from "./ai-prompt-builder";
 import { scoreBadgeClass } from "./tokens";
+import { COVERAGE_REPORT_FORMATS_LABEL } from "./coverage-formats";
 import type { CodeHealthAdapter } from "./code-health-adapter";
 
 export function CoverageView({ adapter }: { adapter: CodeHealthAdapter }) {
@@ -95,6 +99,11 @@ export function CoverageView({ adapter }: { adapter: CodeHealthAdapter }) {
       ) : !data || data.summary.file_count === 0 ? (
         <NoCoverageState />
       ) : (
+        // A report was ingested. `data.inferred` may also be present: when the
+        // report never mentioned some files, the graph answers for exactly
+        // those, and a separate section renders it. The measured body and the
+        // inferred gap stay apart — no percentage is ever derived from the
+        // inferred map.
         <CoverageBody
           data={data}
           untestedFindings={untestedFindings ?? []}
@@ -183,7 +192,7 @@ function CoverageBody({
           f.total_coverable_lines > 0 &&
           f.line_coverage_pct != null &&
           f.line_coverage_pct < 30 &&
-          (f.health_score == null || f.health_score < 6),
+          (f.health_score == null || f.health_score < GOOD_MIN),
       )
       .slice(0, 10)
       .map((f) => {
@@ -321,7 +330,7 @@ function CoverageBody({
     },
     {
       key: "health_score",
-      header: "Health",
+      header: "Code health",
       priority: 2,
       align: "right",
       sortable: true,
@@ -358,7 +367,7 @@ function CoverageBody({
             });
           }}
           title="Generate AI test prompt for this file"
-          className="inline-flex items-center justify-center rounded-md p-1 text-[var(--color-text-tertiary)] hover:text-[var(--color-success)] hover:bg-[var(--color-success)]/10 transition-colors"
+          className="inline-flex items-center justify-center rounded-md p-1 text-[var(--color-text-tertiary)] hover:text-[var(--color-model)] hover:bg-[var(--color-model-muted)] transition-colors"
         >
           <Sparkles className="h-3.5 w-3.5" />
         </button>
@@ -453,9 +462,145 @@ function CoverageBody({
           </p>
         ) : null}
       </OverviewSection>
+
+      {data.inferred ? <CoverageGap data={data} onOpenFile={onOpenFile} /> : null}
     </div>
   );
 }
+
+/**
+ * The files the ingested coverage report never mentioned, answered by the graph.
+ *
+ * This is the hybrid shape: a report exists (so `basis` is `measured` and the
+ * measured body above renders it), but the report's lcov source covered only a
+ * subset of the repo. Every other file was invisible on the Tests tab — not
+ * unindexed and not untested, just never named by the report. The graph knows
+ * whether a test reaches those files, and this section says that.
+ *
+ * It honours the same rules as the pure-inferred view: counts only, no bar and
+ * no percentage (reaching is a file-level fact with no line attribution), and
+ * no health-band colour. `files_total` here is the count of non-measured files,
+ * stated beside `measured_file_count` so the split is explicit.
+ */
+function CoverageGap({
+  data,
+  onOpenFile,
+}: {
+  data: HealthCoverageResponse;
+  onOpenFile: (path: string) => void;
+}) {
+  const map = data.inferred as InferredTestMap;
+  const measured = map.measured_file_count ?? 0;
+  const unreached = map.files.filter((f) => !f.reached);
+  const paths = data.summary.report_paths;
+  const missed = paths ? paths.unmatched + paths.ambiguous : 0;
+
+  return (
+    <OverviewSection
+      title="Files the report didn't cover"
+      description={
+        map.files_total > 0
+          ? `Your coverage report named ${measured.toLocaleString()} files. The dependency graph answers for the other ${map.files_total.toLocaleString()}: ${map.files_reached.toLocaleString()} are reached by a test, ${map.files_not_reached.toLocaleString()} are not. Reaching is not executing, so treat it as a floor, not a measurement.`
+          : "The dependency graph could not answer for the files the coverage report left out."
+      }
+    >
+      {/* Why a file can be missing here: the report named it under a path
+          that did not map to this repository. */}
+      {paths && paths.total > 0 ? (
+        <p className="text-xs text-[var(--color-text-tertiary)]">
+          <span className="tabular-nums">
+            {paths.matched.toLocaleString()} of {paths.total.toLocaleString()}
+          </span>{" "}
+          report paths matched a file in this repository
+          {missed > 0 ? (
+            <>
+              ; {missed.toLocaleString()} did not
+              {paths.unmatched_sample[0] ? (
+                <>
+                  {" "}(for example{" "}
+                  <span className="font-mono">{paths.unmatched_sample[0]}</span>). Set{" "}
+                  <span className="font-mono">coverage.strip_prefix</span> or{" "}
+                  <span className="font-mono">coverage.path_prefix</span> if the
+                  paths are off
+                </>
+              ) : null}
+            </>
+          ) : null}
+          .
+        </p>
+      ) : null}
+      <div className="border-t border-[var(--color-border-default)]">
+        <ResponsiveTable
+          columns={gapColumns}
+          rows={unreached.slice(0, 50)}
+          rowKey={(f) => f.file_path}
+          onRowClick={(f) => onOpenFile(f.file_path)}
+          stacked="sm"
+          bare
+          empty={
+            <EmptyState
+              title="Every file is reached"
+              description="The graph found a test that reaches every file the coverage report didn't name."
+            />
+          }
+        />
+      </div>
+    </OverviewSection>
+  );
+}
+
+const gapColumns: ResponsiveColumn<ReachedFileRow>[] = [
+  {
+    key: "file_path",
+    header: "File",
+    priority: 1,
+    render: (f) => (
+      <span
+        className="block truncate font-mono text-xs text-[var(--color-text-primary)]"
+        title={f.file_path}
+      >
+        {f.file_path}
+      </span>
+    ),
+  },
+  {
+    key: "reached",
+    header: "Reached",
+    priority: 1,
+    render: (f) => (
+      <span className="text-xs text-[var(--color-text-secondary)]">
+        {f.reached ? "yes" : "no"}
+      </span>
+    ),
+  },
+  {
+    key: "nloc",
+    header: "Lines",
+    priority: 3,
+    align: "right",
+    render: (f) => (
+      <span className="tabular-nums text-[var(--color-text-tertiary)]">
+        {f.nloc ?? "—"}
+      </span>
+    ),
+  },
+  {
+    key: "health_score",
+    header: "Code health",
+    priority: 2,
+    align: "right",
+    render: (f) =>
+      f.health_score == null ? (
+        <span className="text-[var(--color-text-tertiary)]">—</span>
+      ) : (
+        <span
+          className={`inline-block rounded px-1.5 py-0.5 text-xs font-semibold ${scoreBadgeClass(f.health_score)}`}
+        >
+          {f.health_score.toFixed(1)}
+        </span>
+      ),
+  },
+];
 
 /**
  * The last resort: no report, and the graph had nothing to say either — an
@@ -474,7 +619,7 @@ function NoCoverageState() {
       <h2 className="text-base font-semibold text-[var(--color-text-primary)]">
         Nothing here can say whether your code is tested
       </h2>
-      <p className="text-[13px] leading-relaxed text-[var(--color-text-secondary)] [text-wrap:pretty]">
+      <p className="text-[15px] leading-relaxed text-[var(--color-text-secondary)] [text-wrap:pretty]">
         No coverage report has been ingested, and the dependency graph found no
         test files to trace either. Either would fill this tab: a report gives the
         lines your tests executed, and the graph alone can name which tests reach
@@ -486,7 +631,7 @@ function NoCoverageState() {
         repowise coverage add coverage.lcov
       </pre>
       <p className="font-mono text-[10px] uppercase tracking-[0.12em] text-[var(--color-text-tertiary)]">
-        LCOV · Cobertura · Clover
+        {COVERAGE_REPORT_FORMATS_LABEL}
       </p>
     </div>
   );

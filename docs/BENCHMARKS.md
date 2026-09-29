@@ -514,7 +514,7 @@ this category with a published empirical defect study. Both tools scored the sam
 |---|---:|---:|---|
 | Recall at a 20%-of-lines review budget | **0.173** | 0.074 | p = 0.003 |
 | Effort-aware ranking (Popt) | **0.607** | 0.462 | p = 0.003 |
-| Defect density, size-normalized (Alert:Healthy) | **2.18x** | 0.56x | p = 0.003 |
+| Defect density, size-normalized (below 4.0 : 8.0 and above) | **2.18x** | 0.56x | p = 0.003 |
 | Discrimination (ROC AUC) | 0.731 | 0.705 | p = 0.054, marginal |
 | Precision at a 20%-of-lines review budget | 0.580 | **0.636** | p = 0.64, a tie |
 
@@ -555,7 +555,7 @@ one that reaches significance and the one to cite.
 Marker weights are **calibrated against a real defect corpus, not hand-tuned**:
 every file scored at a commit preceding the bug window so nothing leaks backward,
 and an L2-logistic fit with file size as an explicit control, so a marker only
-earns weight for defect lift *beyond* being big. Only **26** of the 49 detectors
+earns weight for defect lift *beyond* being big. Only **26** of the 51 detectors
 are permitted to move the defect number, because that is the number carrying these
 accuracy claims.
 

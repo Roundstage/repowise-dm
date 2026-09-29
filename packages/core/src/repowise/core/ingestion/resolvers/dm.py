@@ -32,9 +32,13 @@ def resolve_dm_include(
     relative = posixpath.normpath(posixpath.join(importer_dir, normalized))
 
     root_candidate = normalized if not normalized.startswith("..") else ""
-    candidates = (root_candidate, relative) if importer_path.lower().endswith(".dme") else (
-        relative,
-        root_candidate,
+    candidates = (
+        (root_candidate, relative)
+        if importer_path.lower().endswith(".dme")
+        else (
+            relative,
+            root_candidate,
+        )
     )
     for candidate in candidates:
         if candidate and not candidate.startswith("..") and candidate in ctx.path_set:

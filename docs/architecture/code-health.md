@@ -63,7 +63,9 @@ analysis/health/
 ├── __init__.py                     # public API: HealthAnalyzer, HealthReport
 ├── engine.py                       # orchestrator: walker → biomarkers → scorer
 ├── scoring.py                      # weighted aggregation, category caps, KPIs
-├── grading.py                      # 3 defect-backed bands + NLOC-weighted distribution
+├── ranking.py                      # canonical worst-first key + deduction fold
+├── aggregation.py                  # module rollups, severity/biomarker/score breakdowns
+├── grading.py                      # the five absolute bands + NLOC-weighted distribution
 ├── defect_accuracy.py              # "does the score find the bugs?" self-validation
 ├── trends.py                       # snapshot diff, Declining/Predicted alerts, per-file score series
 ├── signals.py                      # per-file process/people/topology join (surfacing-only)
@@ -84,6 +86,8 @@ analysis/health/
 │   ├── lcov.py                     # LCOV parser (stdlib only)
 │   ├── cobertura.py                # Cobertura XML parser
 │   ├── clover.py                   # Clover XML parser
+│   ├── jacoco.py                   # JaCoCo XML parser
+│   ├── goprofile.py                # Go coverprofile parser (line-based)
 │   └── repowise_json.py            # normalized repowise-coverage-v1 JSON parser
 │
 ├── duplication/                    # native Rabin-Karp clone detection
@@ -138,7 +142,7 @@ core/alembic/versions/
 
 ```
 core/pipeline/
-├── orchestrator.py                 # _run_health_analysis(): builds module_map, runs analyzer
+├── orchestrator.py                 # _run_health_analysis(): builds community_label_map, runs analyzer
 └── persist.py                      # persist_pipeline_result(): writes findings/metrics/snapshot
 ```
 
@@ -156,8 +160,8 @@ cli/src/repowise/cli/commands/
 ```
 server/src/repowise/server/
 ├── mcp_server/
-│   ├── tool_health.py              # @mcp.tool get_health(targets, include, repo, limit)
-│   ├── tool_risk.py                # enriched: health_score, top_biomarkers, coverage_pct
+│   ├── tool_health/                # @mcp.tool get_health(targets, include, repo, limit)
+│   ├── tool_risk.py                # enriched: health_score, top_biomarkers, line_coverage_pct
 │   ├── tool_context.py             # include=["health"]: score, top 2 biomarkers, suggestion
 │   └── tool_overview.py            # code_health block with KPIs
 └── routers/
@@ -169,7 +173,6 @@ server/src/repowise/server/
 
 ```
 packages/ui/src/health/             # shared React components (used by web + future hosted frontend)
-├── kpi-cards.tsx
 ├── file-table.tsx
 ├── biomarker-list.tsx
 ├── coverage-bar.tsx
@@ -177,8 +180,8 @@ packages/ui/src/health/             # shared React components (used by web + fut
 ├── untested-hotspot-warning.tsx
 ├── refactoring-card.tsx
 ├── refactoring-target-list.tsx
-├── health-badge.tsx               # score pill, colored by the 3 health bands
-├── health-distribution-bar.tsx    # NLOC-weighted Alert/Warning/Healthy split
+├── health-badge.tsx               # score pill, colored by the health band
+├── health-distribution-bar.tsx    # NLOC-weighted split across the five bands
 ├── trend-chart.tsx                # repo KPI history (3 series)
 ├── file-trend-chart.tsx           # single file's score-over-time + delta + declining flag
 ├── sparkline.tsx                  # compact inline series (drawer trend)
@@ -204,7 +207,7 @@ tests/unit/health/                  # 99+ tests
 ├── test_organizational_biomarkers.py
 ├── test_dry_violation.py
 ├── test_duplication.py             # tokenizer, hash, detector
-├── test_coverage_parsers.py        # LCOV/Cobertura/Clover/JSON
+├── test_coverage_parsers.py        # LCOV/Cobertura/Clover/JaCoCo/Go/JSON
 ├── test_scoring.py                 # category caps, clamping
 ├── test_scoring_snapshot.py        # stability snapshot: locks caps + deductions
 ├── test_health_config.py           # .repowise/health-rules.json
@@ -295,16 +298,17 @@ returning a list of `BiomarkerResult`s.
 
 ### The full roster
 
-`biomarkers/registry.py` registers **49 detectors**; counting the three
+`biomarkers/registry.py` registers **51 detectors**; counting the three
 governance findings written by the additive pass (`governance.py`) there
-are **52 marker ids**. They divide by what each is permitted to affect:
+are **54 marker ids**. They divide by what each is permitted to affect:
 
 | Group | Count | Scores into |
 |---|---:|---|
-| Defect-scoring | 26 | `defect` (8 of them also `maintainability`) |
+| Defect-scoring | 25 | `defect` (8 of them also `maintainability`) |
 | Performance | 20 | `performance` only |
 | SQL | 3 | `maintainability` only |
 | Governance | 3 | nothing — the finding surfaces, the score is untouched |
+| Advisory | 3 | nothing — measured by construction, kept out of impact-ranked lists unless requested |
 
 The authority is `scoring._BIOMARKER_DIMENSIONS`. Any biomarker **not** listed
 there defaults into `defect`, which is why every `sql_*` and every performance
@@ -315,7 +319,7 @@ golden guarantee (§6).
 
 | Category               | Cap  | Markers |
 |------------------------|------|------------|
-| Organizational         | −3.5 | developer_congestion, knowledge_loss, hidden_coupling, function_hotspot, code_age_volatility, ownership_risk, churn_risk, change_entropy, co_change_scatter, prior_defect, ungoverned_hotspot†, stale_governance†, contradictory_decision† |
+| Organizational         | −3.5‡ | developer_congestion, knowledge_loss, function_hotspot, code_age_volatility, ownership_risk, churn_risk, change_entropy, co_change_scatter, prior_defect, ungoverned_hotspot†, stale_governance†, contradictory_decision† |
 | Structural complexity  | −2.5 | brain_method, low_cohesion, god_class, nested_complexity, bumpy_road, complex_conditional |
 | Test coverage          | −2.0 | untested_hotspot, coverage_gap |
 | Test coverage gradient | −2.0 | coverage_gradient |
@@ -329,6 +333,15 @@ writes them runs *after* scoring completes and never touches
 `HealthFileMetric.score` — so in practice they never deduct. They are counted
 in the table above because `scoring.py` maps them, not because they move a
 number.
+
+‡ A ceiling. The live cap is `history_cap(structure)`, `min(3.5, 1.0 + structure)`,
+where `structure` is the file's capped deduction from every other defect
+category, so git history alone costs a file at most 1.0.
+
+`hidden_coupling` is advisory: still detected, stored and listed, it deducts
+nothing. On its own it ranks defect-prone files near chance (AUC about 0.55), and
+a pre-registered test on 12 repositories no earlier health study used found the
+score without it non-inferior at predicting defects.
 
 The maintainability dimension has its own independent tables
 (`_MAINTAINABILITY_CATEGORY`, caps: structural_complexity 4.0,
@@ -358,7 +371,7 @@ file in the trailing ~6-month window, read from `prior_defect_count`. The
 git indexer classifies a commit as a fix with the **same keyword rule the
 defect benchmark labels fixes with** (`_constants.is_fix_commit`), counts only
 non-merge commits inside the window, and anchors the window to the index's
-`as_of` reference (`REPOWISE_GIT_WINDOW_ANCHOR`): so scoring a historical T0
+`as_of` reference (the indexed commit's committer date): so scoring a historical T0
 checkout measures the fixes *before* T0, never leaking the post-T0 fixes that
 form the benchmark's labels. It carries a **neutral (1.0) weight by design**:
 on the calibration corpus prior-defect history is largely redundant with the
@@ -536,8 +549,9 @@ KPI cards.
 
 ## 8. Trends (`trends.py`)
 
-State-free: callers pass an oldest-first list of snapshot rows. Two
-alerts:
+State-free: callers pass an oldest-first list of snapshot rows. Both alerts
+run over every metric in `_ALERT_METRICS` — hotspot health, the composite
+headline and maintainability — skipping any a snapshot never recorded:
 
 - **Declining Health**: current is ≥ `DECLINE_THRESHOLD` (default 0.5)
   below the snapshot `DECLINE_LOOKBACK` (5) positions back. Fires on the
@@ -545,6 +559,14 @@ alerts:
 - **Predicted Decline**: the three most recent snapshots are each
   strictly below the one before. Magnitude is not required; direction is
   the signal.
+
+Either can come back as a third `kind`, **`history_drag`**: a fall on the
+composite headline where `driver` is `history` and the structure half held or
+improved. It carries the same numbers and the opposite reading, because a
+decline the code shape did not contribute to has nothing to act on and
+reporting it in error red tells a reader their refactoring made things worse.
+Maintainability is code shape already, so it has no halves to split and never
+softens — it is the fall that always deserves the alarm.
 
 `recent_kpis(history, limit=10)` returns a newest-first serialised view
 for the CLI table and MCP `get_health(include=["trend"])` response.
@@ -660,6 +682,9 @@ by the dashboard's file table.
 | Column | Notes |
 |---|---|
 | `score` | 1.0–10.0 final |
+| `defect_score`, `maintainability_score`, `performance_score` | per-pillar; nullable |
+| `structure_deduction`, `history_deduction` | the two halves of the total deduction; nullable on rows written before the split. `counts=code_shape` rescores from `structure_deduction` alone, and a null pair is reported as unscored rather than counted as a ten |
+| `is_test` | stored, not re-derived per surface, so `scope` is one row filter everywhere; nullable on rows predating the column |
 | `max_ccn`, `max_nesting`, `nloc` | aggregate function metrics |
 | `duplication_pct` | percent of NLOC covered by clones; nullable |
 | `has_test_file` | paired or heuristic |
@@ -693,6 +718,7 @@ repowise health --refactoring-targets      # ranked by impact / effort
 repowise health --trend                    # last 10 snapshots + active alerts
 repowise coverage add coverage.lcov        # ingest coverage; can repeat
 repowise coverage add coverage.xml --format cobertura
+repowise coverage check --fail-under 80    # patch-coverage gate for CI, no index needed
 repowise health --format json | jq ...
 ```
 
@@ -711,10 +737,10 @@ silently re-scored for changed files only.
 
 ### `get_health(targets?, include?, repo?, limit?)`
 
-Defined in `tool_health.py`. Modes:
+Defined in `tool_health/tool.py`, which dispatches to one module per mode and block. Modes:
 
 - **Dashboard mode** (`targets=None`): returns repo-level KPIs (with the
-  repo `band`) + the NLOC-weighted `distribution` across the 3 bands +
+  repo `band`) + the NLOC-weighted `distribution` across the bands +
   `worst_files` (top N lowest-scoring) + `top_findings` + a per-module
   `modules` rollup.
 - **Targeted mode** (`targets=[...]`): returns full `metrics` +
@@ -735,7 +761,7 @@ Defined in `tool_health.py`. Modes:
 ### Enrichments on existing tools
 
 - `get_risk(targets)`: each per-target row carries `health_score`,
-  `top_biomarkers`, `coverage_pct`, `branch_coverage_pct`.
+  `top_biomarkers`, `line_coverage_pct`, `branch_coverage_pct`.
 - `get_context(targets, include=["health"])`: per-file `score`,
   `max_ccn`, `max_nesting`, `nloc`, `module`, `duplication_pct`, top
   2 markers (each with a `suggestion` string), a coverage block, and a
@@ -749,8 +775,9 @@ Every response carries the standard `_meta` envelope via `build_meta()`.
 
 ## 13. REST surface
 
-`packages/server/src/repowise/server/routers/code_health.py`. All under
-`/api/repos/{repo_id}/health/`:
+`packages/server/src/repowise/server/routers/code_health/` — a package, one
+module per surface, sharing `scope.py`, `counts.py`, `file_filters.py` and
+`statuses.py`. All routes under `/api/repos/{repo_id}/health/`:
 
 | Route | Returns |
 |---|---|
@@ -761,12 +788,24 @@ Every response carries the standard `_meta` envelope via `build_meta()`.
 | `GET /files/breakdown` | one file's metric + score breakdown + findings + suggestions + per-file `trend` + `signals` |
 | `GET /files/trend` | one file's score-over-time series + current delta + `declining` flag (`?file_path=`) |
 | `GET /trend` | repo KPI history + alerts + last-two-snapshot per-file deltas |
-| `GET /findings` | findings list (filterable by biomarker_type, severity, file_path) |
+| `GET /findings` | findings list, filterable by `biomarker_type`, `file_path`, `dimension`, `status` and severity (`severity` exact, or the `min_severity` floor). The zero-impact dimensions, performance and advisory, are out of the ranked list: name one in `dimension`, name a marker in `biomarker_type`, or pass `include_zero_impact=true` |
 | `GET /coverage` | coverage summary + per-file rows |
 | `POST /coverage` | ingest a coverage report (used by some CI integrations) |
-| `GET /refactoring-targets` | ranked by `total_impact / effort_bucket` |
+| `GET /refactoring-targets` | the work queue: files carrying findings, ranked by `total_impact / effort_bucket`. Takes the findings filters plus `search`, `module` and the `only_hotspots` / `only_untested` / `only_failing` row filters, pages by `limit` + `offset`, and returns `total` with `finding_total` beside it. Impact counts open findings only, so dismissing work moves a file down |
 | `GET /churn-complexity` | churn × complexity scatter points (one per churned file: `commit_count_90d`, `max_ccn`, `nloc`, `score`, `churn_percentile`) |
 | `GET /modules` | NLOC-weighted module rollup table |
+
+`scope` and `counts` are accepted by every route whose figures they could
+change, parsed by the shared `ScopeQuery` / `CountsQuery`, and echoed back. An
+unrecognized value falls back to the default rather than answering a different
+question under the name that was asked for.
+
+`counts=code_shape` is a projection over the two stored deduction columns, not
+a rescore: it re-derives each score from `structure_deduction`, drops
+history-derived findings from the row sets so a list cannot sum past the figure
+above it, and recomputes `total` and every ranking afterwards. Rows with no
+stored split are removed and counted in `unscored_files`. Nothing is written
+back.
 
 Auth is the standard `verify_api_key` dependency from
 `server/deps.py`.
@@ -858,7 +897,7 @@ Other perf notes:
 | `tests/unit/health/test_complexity_walker.py` | Per-language CCN, nesting, cognitive assertions on handcrafted fixtures |
 | `tests/unit/health/test_<biomarker>.py` | Each marker: positive in two languages + one negative |
 | `tests/unit/health/test_duplication.py` | Tokenizer normalization, rolling-hash determinism, co-change weighting |
-| `tests/unit/health/test_coverage_parsers.py` | LCOV / Cobertura / Clover / repowise-JSON happy paths + edge cases |
+| `tests/unit/health/test_coverage_parsers.py` | LCOV / Cobertura / Clover / JaCoCo / Go coverprofile / repowise-JSON happy paths + edge cases |
 | `tests/unit/health/test_scoring.py` | Deduction caps, clamping, KPI math |
 | `tests/unit/health/test_scoring_snapshot.py` | **Stability guard**: caps, severity table, marker-to-category mapping, two known fixture scores |
 | `tests/unit/health/test_trends.py` | Declining + predicted alerts, ordering, per-file series + `file_trend` |
@@ -919,7 +958,7 @@ phases may revisit; the constraints kept v1 shippable.
   flag.
 - **No symbol-level scoring.** Score lives at the file granularity to
   match how engineers think about refactor units. Symbol-level CCN
-  still feeds the file score via `function_metrics`.
+  still feeds the file score via `all_functions`.
 - **No `complexity_estimate` propagation backfill.** The walker writes
   the field as a side effect during the current run; old indexes don't
   get touched until a re-index.
@@ -929,12 +968,11 @@ phases may revisit; the constraints kept v1 shippable.
   `repowise risk` scores a commit or base..head range with a calibrated
   logistic model.)
 - **No letter grade.** The 1–10 score is the single number. The only
-  categorical layer is the 3 defect-backed bands (Healthy/Warning/Alert,
-  `grading.py`); a letter on top would be a third overlapping scale with
-  arbitrary cliffs. The legacy 4-step `scoreBand` in `ui/health/tokens.ts`
-  is retained only as a finer color ramp for file-table pills, not a
-  labeling scheme: surfaced band labels and the distribution use the 3
-  bands.
+  categorical layer is the five absolute bands (Excellent / Good / Fair /
+  Needs work / At risk, `grading.py`); a letter on top would be a third
+  overlapping scale with arbitrary cliffs. Every surface that shows a band
+  word or a band colour reads that one vocabulary — there is no second
+  ramp.
 
 ---
 
@@ -948,7 +986,7 @@ phases may revisit; the constraints kept v1 shippable.
 | Change the suggestion text for a marker | `suggestions._TEMPLATES` |
 | Adjust the trend-alert threshold | `trends.DECLINE_THRESHOLD` / `DECLINE_LOOKBACK` |
 | Change snapshot retention | `crud.HEALTH_SNAPSHOT_RETENTION` |
-| Add a new MCP `include` flag | `tool_health.py`: append handling near the existing `"coverage"` / `"refactoring"` branches |
+| Add a new MCP `include` flag | `tool_health/`: name it in `request.py`, read it in `loading.py`, render it in `blocks.py` beside the existing `"coverage"` / `"refactoring"` blocks |
 | Add a new REST route | `routers/code_health.py`: auth is wired at the router level |
 | Add a new dashboard view | new file under `packages/web/src/app/repos/[id]/health/`, primitives under `packages/ui/src/health/` |
 | Add a CLI flag | `packages/cli/src/repowise/cli/commands/health_cmd.py` |

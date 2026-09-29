@@ -198,6 +198,16 @@ repowise workspace metrics                # human-readable summary
 repowise workspace metrics --json         # raw metrics JSON
 ```
 
+### `repowise workspace impacted-tests <repo:path>...`
+
+Given one or more changed provider files, list the tests in consumer repos worth running. See [Cross-Repo Test Impact](#cross-repo-test-impact).
+
+```bash
+repowise workspace impacted-tests backend:app/routers/users.py
+repowise workspace impacted-tests backend:app/routers/users.py --target-repo frontend --format list | cut -d: -f2- | xargs npx vitest run
+repowise workspace impacted-tests backend:app/routers/users.py --format json
+```
+
 ---
 
 ## Cross-Repo Intelligence
@@ -215,25 +225,90 @@ Useful for:
 
 ### API Contract Extraction
 
-Scans source files for HTTP route handlers, gRPC service definitions, and message topic publishers/subscribers. Then matches providers (servers) with consumers (clients) across repos.
+Scans source files for HTTP routes, gRPC services, database tables, message topics and socket events. Then matches providers (servers) with consumers (clients) across repos.
 
-**Supported patterns:**
+**HTTP routes and calls:**
+
+| Language | Providers (routes served) | Consumers (calls made) |
+|----------|---------------------------|------------------------|
+| JS / TS | Express, Hono, Fastify, Koa, Elysia; NestJS controllers; Next.js App Router; Remix | `fetch`; axios, ky, got, ofetch and their instances; Angular `HttpClient`; HTTP-named wrappers |
+| Python | FastAPI, Flask, Django | requests, httpx (aiohttp through wrappers the index confirms) |
+| PHP | Laravel | Guzzle, Laravel `Http` |
+| Java / Kotlin | Spring, JAX-RS, Micronaut | Feign, `java.net.http`, `RestTemplate`, Ktor (Kotlin) |
+| Go | gin, echo, chi, net/http | net/http |
+| C# | ASP.NET (attribute and minimal API) | HttpClient, UnityWebRequest, Best.HTTP |
+| Ruby | | HTTParty, RestClient, Faraday, Net::HTTP |
+| Rust | Axum, Actix, Rocket | reqwest |
+| Any | OpenAPI 3.x documents | |
+
+**Database tables:**
+
+| Language | Providers (tables declared) | Consumers (tables queried) |
+|----------|-----------------------------|----------------------------|
+| SQL | `CREATE TABLE` / `VIEW` / `MATERIALIZED VIEW`, `ALTER TABLE` | |
+| JS / TS | Prisma, TypeORM, Sequelize, Drizzle, Knex migrations | SQL strings, Knex queries |
+| Python | SQLAlchemy, SQLModel, Django, Alembic | SQL strings |
+| PHP | Eloquent, Laravel migrations | SQL strings, `DB::table` |
+| Java / Kotlin | JPA | SQL strings |
+| Go | | SQL strings |
+| C# | EF Core | SQL strings |
+| Ruby | ActiveRecord | SQL strings |
+
+**gRPC, topics and sockets:**
 
 | Type | Providers | Consumers |
 |------|-----------|-----------|
-| HTTP | Express, FastAPI, Spring, Laravel, Go (gin/echo/chi/net-http), ASP.NET (attribute + minimal API), Rust (Axum routes, Actix/Rocket attribute macros) | fetch/axios/URL-literal wrappers (JS/TS), requests/httpx (Python), HttpClient/UnityWebRequest/Best.HTTP (C#), reqwest (Rust) |
 | gRPC | `.proto` service definitions, plus per-language dialects (Go, Java, Python, C#, TypeScript, NestJS `@GrpcMethod`) | gRPC client stubs |
-| Data / DB | DDL (`CREATE TABLE`/`VIEW`/`MATERIALIZED VIEW`), ORM dialects (SQLAlchemy, Django, JPA, EF Core, ActiveRecord, Eloquent) | Raw SQL string literals in app code (verb-anchored: `SELECT`/`INSERT`/`UPDATE`/`DELETE`/`MERGE`) |
-| Topics | Kafka, RabbitMQ, NATS producers | Corresponding consumers |
-| Socket / WebSocket | SignalR `MapHub<T>("/path")`, FastAPI `@app.websocket("/path")` | ClientWebSocket `ConnectAsync`, SignalR `HubConnectionBuilder.WithUrl`, NativeWebSocket and WebSocketSharp `new WebSocket(...)` |
+| Topics | Kafka (Spring Kafka, kafkajs, kafka-python/confluent, sarama), RabbitMQ (Spring AMQP, amqplib, pika, php-amqplib), NATS, Redis pub/sub (ioredis/node-redis, redis-py, Laravel `Redis::publish`), BullMQ / Bull (`new Queue`, `@InjectQueue`, flows), SQS and SNS (AWS SDK v2/v3, boto3), NestJS `ClientProxy.emit`/`send`, Laravel job dispatch (`X::dispatch()->onQueue()`, `dispatch()`, `Queue::push*`, scheduled jobs) | The corresponding consumers (`new Worker`, `@Processor`, `ReceiveMessageCommand`, sqs-consumer, `subscribe`/`psubscribe`, `@EventPattern`/`@MessagePattern`, Laravel `ShouldQueue` classes on the queues they run on), plus RabbitMQ queue bindings (`bindQueue`, `queue_bind`) |
+| Socket / WebSocket | SignalR `MapHub<T>("/path")`, FastAPI `@app.websocket("/path")`, `ws` `WebSocketServer({ path })`, NestJS `@WebSocketGateway`; events: socket.io `emit` (server and client), Laravel broadcast events (`broadcastOn` / `broadcastAs`), `Broadcast::on`, Pusher `trigger` | ClientWebSocket `ConnectAsync`, SignalR `HubConnectionBuilder.WithUrl`, NativeWebSocket and WebSocketSharp `new WebSocket(...)`, browser/Node `new WebSocket(url)`; events: socket.io `on` / `@SubscribeMessage`, Laravel Echo `listen` and `useEcho`, pusher-js `bind` |
 
-Socket detection is C#/Python only and is toggled by `detect_socket` in the `contracts:` block below.
+Socket detection is toggled by `detect_socket` in the `contracts:` block below.
+An endpoint is identified by its path (`socket::/hubs/game`); a message by its
+event within a scope, `socket::<scope>#<event>`, where the scope is a socket.io
+namespace (`/` unless the file names one) or a broadcast channel. Channels keep
+the wire prefix Pusher gives them (`private-orders.{param}`), and Echo's event
+names are read the way Echo formats them, so `.listen('OrderShipped')` meets a
+Laravel event class `App\Events\OrderShipped` and `.listen('.order.shipped')`
+meets `broadcastAs()` returning `order.shipped`. The emitting side is the
+provider. socket.io, amqplib's `publish`/`consume`, BullMQ, Redis and NestJS
+calls are read only in a file importing the library, since `emit`, `on`,
+`publish` and `subscribe` are common method names.
 
-Data/DB contracts use the id scheme `data::<table>` and render as a `db` edge in the [system graph](#system-graph). The consumer side (SQL string matching) is heuristic and lower-confidence than the ORM-based providers; unlike HTTP and gRPC, there is no field-level breaking-change diffing for data contracts, only table/route-level removal.
+A topic, queue or exchange name is read the way a URL is: a literal, or a name
+the same file assigns exactly once to a literal (Python, Go, Java, PHP class
+constants, and JS/TS `const` including object and enum members such as
+`QUEUES.ticketSold`), is resolved; a name built at runtime is skipped rather
+than guessed. An SQS queue URL is named by its last path segment and an SNS
+topic ARN by its last field. A subscription by pattern (NATS `orders.*` /
+`orders.>`, Redis `psubscribe`, Kafka `topicPattern`) links to every publisher
+whose name it matches. A Laravel job dispatched without a queue runs on the
+queue its class declares (`public $queue`, `$this->onQueue()`, `viaQueue()`),
+found by the class's fully qualified name; one left on the connection's
+default queue is not recorded, since every app has one. RabbitMQ
+publishers name an exchange and a routing key while consumers name a queue, so
+a queue binding found anywhere in the workspace connects the two: each consumer
+of the bound queue links to the exchange's publishers whose routing key the
+binding pattern accepts (`*` and `#` follow topic-exchange rules; an empty key
+or pattern matches everything, while a key the source does not settle matches
+nothing). Such a link carries the exchange as its `contract_id` and the queue as
+`consumer_contract_id`. When no consumer of the bound queue is found, the
+binding site itself is linked. A publish to the default exchange
+(`publish('', 'jobs')`) is a publish to the queue `jobs`.
+
+Data/DB contracts use the id scheme `data::<table>` and render as a `db` edge in the [system graph](#system-graph). An ORM model with no explicit table name takes its library's default: the Prisma model name, the TypeORM class name in snake case, the Sequelize model name pluralized, the Eloquent class name in snake case and plural. A service that only models a table (an ORM class, no migration) is linked to the service whose migration or DDL defines that table's schema, when exactly one service defines it; two services that each migrate a table of one name are read as separate databases and not linked. The consumer side (SQL string matching) is heuristic and lower-confidence than the ORM-based providers; unlike HTTP and gRPC, there is no field-level breaking-change diffing for data contracts, only table/route-level removal.
 
 HTTP routes are matched on their **full** path: a router mount prefix
 (`APIRouter(prefix=...)`, `include_router(prefix=...)`, Express `app.use('/x', router)`,
-Go route groups) is stitched onto each handler path before matching. A client call
+Go route groups, Laravel `Route::prefix(...)->group(...)` and `Route::group(['prefix' => ...])`)
+is stitched onto each handler path before matching. Laravel's `routes/api.php` is
+served under `/api` unless `bootstrap/app.php` (`apiPrefix`) or a route provider says
+otherwise, and `Route::resource` / `apiResource` expand into the routes they register. A NestJS
+route is served at the app's `setGlobalPrefix` (unless its `exclude` list names the route), then
+its URI version (`enableVersioning`, `@Version`), then the `@Controller` prefix. A call through an
+axios, ky, got or ofetch instance is read with the instance's `baseURL` / `prefixUrl`, also when
+another file imports the instance. An Angular `HttpClient` call is read on any receiver typed
+or injected as `HttpClient`, with `environment.apiUrl` folded from `src/environments/` and class
+fields built on it; a base an interceptor prepends is not read. A client call
 whose base URL is an unresolved placeholder (`fetch(\`${API_BASE}/users\`)`) matches
 on the host-relative path; the link is **exact** when exactly one workspace service
 provides that path and a lower-confidence **candidate** when the target is ambiguous.
@@ -279,7 +354,34 @@ excluded from matching and reported under the `external_host` diagnostics reason
 
 ### Package Dependency Scanning
 
-Reads package manifests (`package.json`, `pyproject.toml`, `Cargo.toml`, `go.mod`, `.csproj`) to detect when one repo depends on another as a package. Maven `pom.xml` is not scanned, so a Maven repo gets no package edges.
+Reads package manifests (`package.json`, `composer.json`, `pyproject.toml`,
+`Cargo.toml`, `go.mod`, `.csproj`, and Maven `pom.xml`) to detect when one repo
+depends on another as a package or project.
+
+npm and composer dependencies match in two ways: a local path (`file:` specs,
+workspace globs, composer `path` repositories) that resolves into a sibling repo,
+or a package name that exactly one sibling repo publishes. For npm, a repo
+publishes its root `package.json` and its declared workspace members, so a
+vendored or fixture `package.json` never claims a name. For composer, every
+`composer.json` up to three directories deep counts, outside `vendor/`, hidden
+directories, tests, fixtures and examples, which covers split packages such as
+`src/Illuminate/Support/composer.json`. A name two repos publish links to
+neither.
+
+Maven matching is filesystem-only and coordinate-based. Repowise resolves local
+reactor modules, local parents, properties, and dependency-management versions,
+then links an active direct compile/runtime dependency only when exactly one
+selected workspace project publishes that `groupId:artifactId`. Test, provided,
+system, optional, profile-only, ambiguous, and external dependencies do not create
+production package edges. Bounded diagnostics retain the reason for Maven
+non-matches. When a repository has a root `pom.xml`, only that declared reactor is
+eligible; unrelated nested example or fixture POMs are not treated as producers.
+
+This does **not** execute Maven, read user settings, download artifacts, resolve
+plugins/transitive dependencies/imported BOMs, or infer generated sources. A Maven
+package edge is also not a published symbol-level code API or a runnable Maven
+target recommendation; those capabilities are reported separately and remain
+unsupported.
 
 ---
 
@@ -287,7 +389,7 @@ Reads package manifests (`package.json`, `pyproject.toml`, `Cargo.toml`, `go.mod
 
 The contracts, package dependencies, and co-changes above are each a flat list. repowise folds them into a single normalized **system graph**, the one structure every cross-repo view reads. It is rebuilt automatically on every `repowise update --workspace` and persisted to `.repowise-workspace/system_graph.json`.
 
-**Nodes are services, not repos.** A monorepo with three detected service boundaries (a `package.json` / `go.mod` / `Cargo.toml` sub-directory) shows three nodes; the repo is a grouping attribute on each node. A repo with no sub-boundary collapses to a single repo-root node. Each node carries its provider/consumer counts, the contract types it participates in, and flags for orphan/isolated services.
+**Nodes are services, not repos.** A monorepo with three detected service boundaries (a `package.json` / `composer.json` / `go.mod` / `Cargo.toml` sub-directory) shows three nodes; the repo is a grouping attribute on each node. A repo with no sub-boundary collapses to a single repo-root node. Each node carries its provider/consumer counts, the contract types it participates in, and flags for orphan/isolated services.
 
 **Edges are typed and honest.** Every edge carries:
 
@@ -359,11 +461,11 @@ The map appears once the workspace has at least two indexed repositories with de
 
 ## Cross-Repo Blast Radius
 
-Blast radius answers a single question: **if I change this service, what downstream services and repos break?** It walks the [system graph](#system-graph) *against* its edge direction, a `consumer → provider` edge means changing the provider impacts the consumer, and returns every reachable service ranked by an impact score.
+Blast radius answers a single question: **if I change this service, which downstream services and repos are structurally exposed?** It walks the [system graph](#system-graph) *against* its edge direction, a `consumer → provider` edge means changing the provider may impact the consumer, and returns every reachable service ranked by an impact score.
 
 Two edge classes are weighted and labelled distinctly:
 
-- **Structural** edges (http / grpc / event / package / db) assert a real dependency, a contract or an import. They propagate impact at full weight and surface as **will break**.
+- **Structural** edges (http / grpc / event / package / db) assert a real dependency, a contract or an import. They propagate impact at full weight and surface under the compatibility-named **will break** field, but mean structural reach rather than certain runtime failure.
 - **Behavioral** co-change edges only assert that two files historically *changed together*. They are correlation, not a call, so they propagate at half weight (one named constant, `BEHAVIORAL_EDGE_WEIGHT`) and surface as **may drift**.
 
 Each impacted service carries its `distance` (hops from the change) and `score` (0-1, with distance decay and the behavioral weighting baked in). Nearer, structural impact ranks highest.
@@ -378,7 +480,7 @@ Use it three ways:
 
 ## Breaking-Change Guard
 
-Where blast radius answers *what could be affected*, the breaking-change guard answers a sharper question: **did a provider change in a way that actually breaks its consumers?** On every `repowise update --workspace`, the freshly-extracted contracts are diffed against the previously-indexed set and each incompatible provider change is reported with the exact consumer files that call it.
+Where blast radius answers *what could be affected*, the breaking-change guard answers a sharper question: **did a provider contract change incompatibly?** On every `repowise update --workspace`, freshly extracted contracts are diffed against the previously indexed set. Each finding carries the consumer files linked to the endpoint, but that link proves endpoint exposure only. It does not prove use of the changed field, a runtime failure, or deployment safety.
 
 Detected change kinds (a registry, adding a kind is one new rule, never an `if/elif`):
 
@@ -388,17 +490,54 @@ Detected change kinds (a registry, adding a kind is one new rule, never an `if/e
 | `removed_field` | breaking (response) / warning (request) | A request or response field disappeared |
 | `field_type_changed` | breaking | A field's type changed (e.g. `string → int64`) |
 | `field_number_changed` | breaking | A proto field's wire number changed |
-| `field_required` | breaking | A field became required, or a new required field was added |
+| `field_required` | breaking | A request field became required, or a new required request field was added; legacy proto/signature behavior is preserved |
+| `field_required_relaxed` | breaking | A required OpenAPI response field became optional |
+| `field_nullability_changed` | breaking | An OpenAPI request stopped accepting null, or a response started allowing null |
+| `field_enum_changed` | breaking | An OpenAPI request enum lost values, or a response enum gained values |
+| `schema_comparison_uncertain` | warning | Schema source/fidelity, completeness, or selected response changed, so field compatibility was not inferred |
 
-**Non-breaking changes never flag**, an added *optional* field, a widened set, or a brand-new endpoint produces no record. Field-level diffs need a contract *schema*; today only gRPC carries one (proto message fields, recovered by the existing proto parser), so field-level checks are gRPC-only. HTTP contracts have no schema, and OpenAPI specs are not read. Route-level removal is detected for every transport from the contract id alone, HTTP included.
+OpenAPI comparison covers the common supported subset of `3.0.x`, `3.1.x`, and `3.2.x`: JSON/YAML documents; path/query/header/cookie parameters using OpenAPI's default `style`, `explode`, and `allowReserved` behavior; one `application/json` request body; exactly one explicit JSON 2xx response; recursive objects and arrays; exact primitive types; requiredness; normalized nullability; finite homogeneous scalar enums; and bounded same-document JSON Pointer references. Request rules describe values the provider accepts; response rules describe values consumers may receive, so requiredness, nullability, enum values, and constrained/unconstrained enum transitions reverse between the two sides. Operation removal remains the transport-neutral contract rule.
 
-Impacted consumers are resolved from the matched contract links, the same provider↔consumer evidence the [system graph](#system-graph)'s edges are built from, so impact is endpoint-precise (the consumer file that calls the changed contract) and direct (the first reachability hop, which is exactly what a contract break endangers; transitive ripple stays the job of blast radius).
+Only complete sides with the same schema source and comparison-fidelity key are field-diffed. Unsupported/unresolved nodes, extraction-strategy changes, and response-selection changes become warning-level uncertainty rather than shortened schemas or false removals. Remote/cross-file references, composition, additional-properties semantics, arbitrary JSON Schema constraints, non-JSON or ambiguous media, multiple materially different success responses, and OpenAPI 2.0 are outside this boundary. No network dereferencing occurs.
+
+**Compatible changes stay quiet**: examples include an optional request addition, a request enum widening, a request becoming nullable, a response enum narrowing, a response becoming non-nullable, an additional response field in the supported open-object subset, and a brand-new endpoint. A rename remains a removal plus an addition; no rename inference is attempted.
+
+Endpoint-exposed consumers are resolved from the matched contract links, the same provider↔consumer evidence the [system graph](#system-graph)'s edges are built from. The evidence is direct and endpoint-level: it identifies a consumer file linked to the changed contract, but not the exact field it uses. Transitive structural reach stays the job of blast radius.
 
 Use it three ways:
 
 - **REST**, `GET /api/workspace/breaking-changes` returns the report from the most recent update (filterable by `repo` or `severity`). Each change carries its provider, detail, and impacted consumers with both code sides.
-- **MCP**, the `get_risk` PR-mode directive gains a `breaking_changes` block listing the provider contracts that changed incompatibly in the diff's repo and the consumers they endanger, across repos.
-- **System Map**, toggle **Breaking changes** above the map: changed providers are badged with their breaking count, the consumers they endanger are badged *at risk*, and the seams between them are highlighted (additive overlay, the map stays whole). A side panel lists each change with both the provider and consumer files.
+- **MCP**, the `get_risk` PR-mode directive's compatibility-named `breaking_changes` block lists provider incompatibilities and comparison warnings with side, source/fidelity, and endpoint-exposed consumers across repos.
+- **System Map**, toggle **Breaking changes** above the map: changed providers are badged by severity. Consumers and seams are marked *exposed* only for provider incompatibilities; warning-only uncertainty is never rendered as a consumer failure claim. A side panel lists each finding with both code sides.
+
+---
+
+## Cross-Repo Test Impact
+
+Where the breaking-change guard identifies provider incompatibility and endpoint exposure, test impact answers the question you ask before you push: **I changed this provider file, which tests in the other repos should I run?** It starts from the same matched contract links and then walks each consumer's own index to find tests that exercise the call site. A recommended test validates the exposed consumer path; it is not proof that the changed field is used or that a deployment will fail.
+
+```bash
+repowise workspace impacted-tests backend:app/routers/users.py
+```
+
+Three output formats: `table` (the default, grouped by consumer repo), `json` (the full result, including the counts below), and `list` (one `repo:test-file` per line, for piping into a test runner).
+
+Every consumer call site the walk considers ends in one of four states, and the command names the one it landed on:
+
+- **measured**, a coverage map ingested from that repo says the test actually ran the consumer code. The strongest evidence, and it only exists where coverage has been ingested.
+- **inferred**, no coverage, but the consumer's call graph or import graph reaches the call site from a test. The call graph is entered at the *symbol* the contract bound to, not the file, so a test that reaches an unrelated function in the same file is not recommended. The import fallback only knows files, so it is entered at the file; every row says which it was, in the `entry` field of its evidence.
+- **none**, the consumer was analyzed and nothing reaches the call site. A real answer, not a failure: that code has no test guarding it.
+- **unresolved**, the join could not determine an answer. Four causes, each reported by name: the consumer repo has no index, the contract never bound to a symbol, the bound symbol is no longer in the index, or the lookup itself failed.
+
+An empty answer always says which of these produced it, so "no tests" is never ambiguous between "nothing guards this" and "we could not look". That holds in every format: the `table` format prints a `Could not determine` table listing the unresolved links with their reason, `json` carries the states and the unresolved rows, and `list` writes the explanation and the unresolved count to stderr so the piped list on stdout stays clean.
+
+Results are capped per consumer and provider pair so one widely-called helper cannot flood the list; when the cap bites, the command prints how many it dropped and `--format json` carries the exact counts.
+
+Use it three ways:
+
+- **CLI**, `repowise workspace impacted-tests <repo:path>...`, the command above.
+- **REST**, `GET /api/workspace/test-impact?repo=<alias>&file=<path>`. Repeat `file` for several changed files in the same repo. The response carries the same fields the `--format json` output has: `recommendations` (each with its consumer repo, the `consumer_files` and bound `consumer_symbol_ids` that reached the test, `basis`, `via`, `confidence` and the contract ids that produced it), `unresolved` with a reason per link, `files_analyzed` with the state each landed on, and the `summary` counts. Over the API an empty answer's `summary.reason` is `no_contract_data`, `no_matching_links` or `lookup_failed`.
+- **Web UI**, a provider contract's page (`/workspace/contracts/detail`) ends in a **Tests to run** section: the tests grouped by consumer repo, each marked measured or inferred and saying whether the coverage map, the call graph or the import graph found it, and a **Could not determine** list naming the consumer file and the reason. A consumer contract has no such section, since tests are found on the consumer side.
 
 ---
 
@@ -503,7 +642,7 @@ Workspace init automatically registers MCP servers with Claude Desktop and Claud
 
 - **Default repo context**, queries go to the primary repo unless you specify otherwise
 - **Cross-repo tools**, MCP tools can query across repos and return enriched context with co-change and contract data; `get_blast_radius` answers cross-repo downstream impact (see [Cross-Repo Blast Radius](#cross-repo-blast-radius)); `get_conformance` answers architecture rule violations and dependency cycles (see [Architecture Conformance](#architecture-conformance)); `get_architecture` answers whole-system coupling, the cyclic core, and the architecture score (see [Architecture Metrics](#architecture-metrics))
-- **Repo parameter**, most tools accept an optional `repo` parameter to target a specific repo, or `"all"` to query across the workspace
+- **Repo parameter**, most tools accept an optional `repo` parameter to target a specific repo. Four also accept `"all"` to query across the workspace: `get_overview` (workspace topology and a summary per repo), `search_codebase` (results from every repo), `get_dead_code` (findings from every repo) and `get_why` with a query (decisions from every repo). The other tools answer about one repo at a time
 
 ---
 

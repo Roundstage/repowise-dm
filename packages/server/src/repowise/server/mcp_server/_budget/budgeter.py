@@ -24,18 +24,21 @@ the smallest that DID was 60,718 — consistent with a 25000-token cap at the
 half that line. The residual risk is a user who *lowers*
 ``MAX_MCP_OUTPUT_TOKENS``, which :func:`effective_char_budget` clamps for.
 
-The estimator is intentionally dependency-free: 4 chars/token is the
-widely-quoted average for English + code on BPE tokenizers, and it undercounts
-the compact JSON we emit by roughly 1.7x. ``HOST_CAP_BUDGET_FRACTION`` absorbs
-that gap plus the JSON envelope and ``_meta`` the host counts on top.
+The estimator is dependency-free: it charges each content class of the
+serialised payload at a rate measured against the o200k_base tokenizer. A
+single divisor over the whole response undercounts, worst on the payloads that
+are mostly paths and identifiers. ``HOST_CAP_BUDGET_FRACTION`` absorbs the JSON
+envelope and ``_meta`` the host counts on top of ours.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 from collections.abc import Sequence
+from dataclasses import dataclass
 from typing import Any
 
 from repowise.server.mcp_server._budget.collector import OmissionCollector
@@ -43,6 +46,7 @@ from repowise.server.mcp_server._budget.collector import OmissionCollector
 logger = logging.getLogger(__name__)
 
 TOKEN_BUDGET = 8000
+#: The char ceiling the truncation path measures against, not an estimate.
 CHARS_PER_TOKEN = 4
 CHAR_BUDGET = TOKEN_BUDGET * CHARS_PER_TOKEN
 
@@ -86,15 +90,59 @@ def effective_char_budget(configured: int = CHAR_BUDGET) -> int:
     return min(configured, host_char_ceiling)
 
 
-def estimate_response_tokens(obj: Any) -> int:
-    """Cheap upper-bound token estimate for an arbitrary JSON-serialisable object.
+# Measured chars/token against the o200k_base tokenizer on recorded tool
+# responses. Paths and identifiers run densest, prose loosest.
+CHARS_PER_TOKEN_JSON_STRUCTURE = 3.7
+CHARS_PER_TOKEN_PATH = 3.4
+CHARS_PER_TOKEN_CODE_BODY = 3.8
+CHARS_PER_TOKEN_PROSE = 4.5
 
-    Serialises to compact JSON (the wire format the MCP layer eventually emits)
-    and divides by ``CHARS_PER_TOKEN``. We use the serialised form — not just
-    raw text fields — because structural JSON overhead (quotes, braces, field
-    names) is non-trivial and is what the downstream tokenizer actually sees.
+_CODE_PUNCTUATION = frozenset("(){}[]<>=;:+-*/%&|!@#$^~`_.")
+
+#: Punctuation share above which a whitespace-bearing string reads as code.
+#: Calibrated so a source body lands on the code side and an English sentence
+#: carrying identifiers does not.
+_CODE_PUNCTUATION_SHARE = 0.05
+
+
+def _content_class(text: str) -> str:
+    """Classify one JSON string leaf by how densely it tokenizes."""
+    if not any(character.isspace() for character in text):
+        return "path"
+    punctuation = sum(1 for character in text if character in _CODE_PUNCTUATION)
+    return "code" if punctuation >= len(text) * _CODE_PUNCTUATION_SHARE else "prose"
+
+
+def _add_leaf_chars(obj: Any, totals: dict[str, int]) -> None:
+    """Accumulate the serialised length of every string leaf, per content class."""
+    if isinstance(obj, str):
+        totals[_content_class(obj)] += len(json.dumps(obj))
+    elif isinstance(obj, dict):
+        for value in obj.values():
+            _add_leaf_chars(value, totals)
+    elif isinstance(obj, (list, tuple)):
+        for value in obj:
+            _add_leaf_chars(value, totals)
+
+
+def estimate_response_tokens(obj: Any) -> int:
+    """Token estimate for an arbitrary JSON-serialisable object.
+
+    Measures the compact JSON the MCP layer emits rather than the text fields
+    alone, because field names, quotes, and braces are what the downstream
+    tokenizer sees. Each string leaf is charged at its content class's rate and
+    everything left over (keys, punctuation, numbers, literals) at the
+    structural one.
     """
-    return len(json.dumps(obj, separators=(",", ":"), default=str)) // CHARS_PER_TOKEN
+    leaves = {"path": 0, "code": 0, "prose": 0}
+    _add_leaf_chars(obj, leaves)
+    structure = max(0, response_chars(obj) - sum(leaves.values()))
+    return int(
+        structure / CHARS_PER_TOKEN_JSON_STRUCTURE
+        + leaves["path"] / CHARS_PER_TOKEN_PATH
+        + leaves["code"] / CHARS_PER_TOKEN_CODE_BODY
+        + leaves["prose"] / CHARS_PER_TOKEN_PROSE
+    )
 
 
 # Reserved for what the collector appends after the last fit check: the
@@ -118,6 +166,44 @@ def over_budget(
     return response_chars(response) > budget - headroom
 
 
+#: A requested collection keeps whichever of these is larger.
+REQUESTED_MIN_ROWS = 3
+REQUESTED_MIN_SHARE = 0.25
+
+
+def entitled_floor(total: int) -> int:
+    """Rows a caller-requested collection keeps before anything else sheds."""
+    if total <= REQUESTED_MIN_ROWS:
+        return total
+    return min(total, max(REQUESTED_MIN_ROWS, math.ceil(total * REQUESTED_MIN_SHARE)))
+
+
+def shed_stem(key: str) -> str:
+    """The response path a shed-order key names, with the ``[]`` form removed."""
+    return key[:-2] if key.endswith("[]") else key
+
+
+def _rows_to_keep(rows: Any, requested: bool) -> int:
+    """Tail-shed floor for one collection: its entitlement, or one row."""
+    if not requested or not isinstance(rows, (list, dict)):
+        return 1
+    return entitled_floor(len(rows))
+
+
+@dataclass(frozen=True)
+class _ShedLimits:
+    """The knobs every key in one :func:`fit_to_budget` pass shares."""
+
+    headroom: int
+    char_budget: int | None
+    record_counts: bool
+
+    def exceeded(self, response: dict[str, Any]) -> bool:
+        return over_budget(
+            response, headroom=self.headroom, char_budget=self.char_budget
+        )
+
+
 def fit_to_budget(
     response: dict[str, Any],
     order: Sequence[str],
@@ -126,6 +212,7 @@ def fit_to_budget(
     headroom: int = FIT_HEADROOM_CHARS,
     char_budget: int | None = None,
     record_counts: bool = False,
+    entitled: frozenset[str] | None = None,
 ) -> dict[str, Any]:
     """Shed whole blocks named by *order* until *response* fits the budget.
 
@@ -135,12 +222,18 @@ def fit_to_budget(
     first. Shedding stops the moment the response fits, so an under-budget
     response — the common case — is untouched.
 
+    *entitled* names stems the caller asked for; their ``[]`` passes stop at
+    :func:`entitled_floor` instead of one row. The order still decides when a
+    block is reached, and the ceiling still wins.
+
     Drops go to *collector* as expandable ``[repowise#<ref>]`` markers and set
     ``truncated``. Call before the caller's :meth:`OmissionCollector.attach`,
     which is what ``headroom`` reserves for.
     """
+    limits = _ShedLimits(headroom, char_budget, record_counts)
+    requested = entitled or frozenset()
     for key in order:
-        if not over_budget(response, headroom=headroom, char_budget=char_budget):
+        if not limits.exceeded(response):
             break
         container, _, leaf = key.rpartition(".")
         target: Any = response
@@ -149,16 +242,8 @@ def fit_to_budget(
         if not isinstance(target, dict):
             continue
         if leaf.endswith("[]"):
-            _shed_tail(
-                response,
-                target,
-                leaf[:-2],
-                key[:-2],
-                collector,
-                headroom,
-                char_budget,
-                record_counts,
-            )
+            keep = _rows_to_keep(target.get(leaf[:-2]), shed_stem(key) in requested)
+            _shed_tail(response, target, leaf[:-2], key[:-2], collector, limits, keep)
         elif target.get(leaf):
             value = target.pop(leaf)
             collector.add(key, value)
@@ -174,19 +259,16 @@ def _shed_tail(
     leaf: str,
     label: str,
     collector: OmissionCollector,
-    headroom: int,
-    char_budget: int | None,
-    record_counts: bool,
+    limits: _ShedLimits,
+    keep: int = 1,
 ) -> None:
-    """Drop ranked rows from the tail of ``container[leaf]`` until it fits."""
+    """Drop ranked rows from the tail of ``container[leaf]`` down to *keep*."""
     rows = container.get(leaf)
     if not isinstance(rows, (list, dict)):
         return
     total = len(rows)
     dropped: list[Any] = []
-    while len(rows) > 1 and over_budget(
-        response, headroom=headroom, char_budget=char_budget
-    ):
+    while len(rows) > keep and limits.exceeded(response):
         if isinstance(rows, list):
             dropped.append(rows.pop())
         else:
@@ -194,7 +276,7 @@ def _shed_tail(
             dropped.append({name: rows.pop(name)})
     if dropped:
         collector.add(label, list(reversed(dropped)))
-        if record_counts:
+        if limits.record_counts:
             prior_reason = container.get(f"{leaf}_reduced_reason")
             collection_total = max(
                 total, int(container.get(f"{leaf}_total") or 0)
@@ -234,21 +316,24 @@ def _record_reduction(
 
     reductions = response.setdefault("_meta", {}).setdefault("reductions", [])
 
-    def visit(node: Any, node_path: str) -> None:
+    def visit(node: Any, node_path: str, parent: dict[str, Any], name: str) -> None:
         if isinstance(node, list):
+            # An earlier tail-shed may already have trimmed this list and left
+            # the population beside it. Reporting len() here would count only
+            # what the trim left, not what the caller lost overall.
             reductions.append(
                 {
                     "field": node_path,
-                    "total": len(node),
+                    "total": max(len(node), int(parent.get(f"{name}_total") or 0)),
                     "emitted": 0,
                     "reason": "response_budget",
                 }
             )
         elif isinstance(node, dict):
-            for name, child in node.items():
-                visit(child, f"{node_path}.{name}")
+            for child_name, child in node.items():
+                visit(child, f"{node_path}.{child_name}", node, child_name)
 
-    visit(value, path)
+    visit(value, path, container, field)
 
 
 def _with_budget_reason(prior_reason: Any) -> str:

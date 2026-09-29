@@ -15,13 +15,16 @@ __all__ = [
     "_FIELD_SEP",
     "_LOG_FORMAT",
     "_RECORD_SEP",
+    "GitHistoryCoverage",
     "GitIndexSummary",
+    "RenameTrail",
     "RepoTotals",
     "_CommitRec",
     "_extract_rename_paths",
     "_parse_commit_record",
     "_should_skip_index",
     "capture_repo_totals",
+    "name_status_path",
 ]
 
 # Git log record/field separators (NUL byte + US 0x1f) — chosen so they can't
@@ -170,6 +173,41 @@ def _parse_commit_record(record: str) -> tuple[dict, list[str]] | None:
 
 
 @dataclass
+class GitHistoryCoverage:
+    """Achieved file-history coverage for one Git indexing run."""
+
+    eligible_files: int = 0
+    files_with_history: int = 0
+    unavailable_files: int = 0
+    retained_commits: int = 0
+    per_file_limit: int = 0
+    global_commits: int = 0
+    deep_commits: int = 0
+    recent_files: int = 0
+    deep_files: int = 0
+    fallback_files: int = 0
+    complete_through_depth: int = 0
+    workers: int = 1
+
+    def to_dict(self) -> dict[str, int]:
+        """Stable JSON shape used by state/progress provenance."""
+        return {
+            "eligible_files": self.eligible_files,
+            "files_with_history": self.files_with_history,
+            "unavailable_files": self.unavailable_files,
+            "retained_commits": self.retained_commits,
+            "per_file_limit": self.per_file_limit,
+            "global_commits": self.global_commits,
+            "deep_commits": self.deep_commits,
+            "recent_files": self.recent_files,
+            "deep_files": self.deep_files,
+            "fallback_files": self.fallback_files,
+            "complete_through_depth": self.complete_through_depth,
+            "workers": self.workers,
+        }
+
+
+@dataclass
 class GitIndexSummary:
     files_indexed: int
     hotspots: int
@@ -179,6 +217,8 @@ class GitIndexSummary:
     # for ``upsert_git_commits_bulk``. Empty in rename-tracking mode (which uses
     # the per-file walk instead of the batched commit index).
     commit_rows: list[dict] = field(default_factory=list)
+    # One row per (commit, file), from the same walk as ``commit_rows``.
+    commit_file_rows: list[dict] = field(default_factory=list)
     # Per fix-commit x file rows for ``upsert_fix_events_bulk``, plus the
     # committer time of the oldest fix the walk saw (unix seconds). The cutoff
     # rides along so the persist step can prune events that have aged out and
@@ -194,6 +234,7 @@ class GitIndexSummary:
     # contributor counts instead of deriving them from the bounded sample
     # (issue #730). None when git is unavailable or the repo has no commits.
     repo_totals: RepoTotals | None = None
+    history_coverage: GitHistoryCoverage | None = None
 
 
 _RENAME_RE = re.compile(r"\{(.*?) => (.*?)\}")
@@ -207,6 +248,7 @@ def _extract_rename_paths(stat_path: str, known_paths: set[str]) -> tuple[str | 
         10\t5\t{old => new}/shared_suffix
         10\t5\told_dir/{old_name => new_name}.py
         10\t5\tsrc/{ => newdir}/shared_suffix
+        10\t5\told.py => pkg/new.py
 
     The third form has an EMPTY side: a directory inserted into (or removed
     from) the middle of a path. Expanding the empty side leaves a doubled
@@ -225,7 +267,51 @@ def _extract_rename_paths(stat_path: str, known_paths: set[str]) -> tuple[str | 
         known_paths.add(old_path)
         known_paths.add(new_path)
         return old_path, new_path
+    # Paths sharing no leading or trailing component get no braces: ``a.py => src/b.py``.
+    old_path, sep, new_path = stat_path.partition(" => ")
+    if sep and old_path and new_path:
+        known_paths.add(old_path)
+        known_paths.add(new_path)
+        return old_path, new_path
     return None, None
+
+
+class RenameTrail:
+    """Maps a path as it was at some commit to the path that file has at HEAD.
+
+    Every history walk runs newest first, so a rename is seen before any commit
+    older than it. Resolving each path through the renames seen so far carries
+    a file's pre-rename commits over to its current name, and a path reused by
+    a different file after the rename keeps its own history, because commits
+    to the reused path are all newer than the rename.
+
+    Record a commit's renames only after resolving that commit's own paths: a
+    commit that moves ``a`` to ``b`` and creates a new ``a`` must not hand the
+    new ``a`` to ``b``.
+    """
+
+    __slots__ = ("_current",)
+
+    def __init__(self) -> None:
+        self._current: dict[str, str] = {}
+
+    def resolve(self, path: str) -> str:
+        return self._current.get(path, path)
+
+    def record(self, old_path: str, new_path: str) -> None:
+        current = self.resolve(new_path)
+        if old_path == current:
+            self._current.pop(old_path, None)
+        else:
+            self._current[old_path] = current
+
+
+def name_status_path(line: str) -> tuple[str, str | None]:
+    """``(path, renamed_from)`` for one ``--name-status`` (or ``--name-only``) line."""
+    parts = line.strip().split("\t")
+    if len(parts) >= 3 and parts[0].startswith("R"):
+        return parts[2], parts[1]
+    return parts[-1], None
 
 
 @dataclass

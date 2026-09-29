@@ -166,6 +166,7 @@ Grouped by what you are trying to do. Every flag for every command lives in the
 | `repowise health` | Lowest-scoring files and why. `--trend` for direction, `--refactoring-targets` for concrete plans. |
 | `repowise risk main..HEAD` | Repo-relative review percentile/classification plus a supporting 0-10 diff-shape score. |
 | `repowise dead-code` | What nothing references any more, by confidence tier. |
+| `repowise doc-drift` | Documentation whose claims about the tree no longer hold, by confidence. |
 | `repowise decision list` | Architectural decisions, their evidence and status. |
 | `repowise impacted-tests` | Only the tests a diff actually exercises. |
 
@@ -410,6 +411,17 @@ repowise init --no-prose -y             # free, no keys in CI, no questions
 repowise risk "$BASE_SHA..$HEAD_SHA"    # gate or annotate on review priority
 repowise export --format markdown --output ./docs/wiki/   # static hosting
 ```
+
+To gate a pull request on the coverage of the lines it changed, run the tests
+with a coverage report and add:
+
+```bash
+repowise coverage check "origin/$BASE_BRANCH...HEAD" --report coverage/lcov.info --fail-under 80
+```
+
+It needs no index and no key, only git and the report. A shallow clone needs
+full history for the merge-base. Exit `1` means below the gate, `2` means it could not
+run. See [Patch coverage in CI](../layers/TEST_INTELLIGENCE.md#patch-coverage-in-ci).
 
 ### Changing provider or model
 

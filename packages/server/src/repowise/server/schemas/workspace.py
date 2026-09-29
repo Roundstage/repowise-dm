@@ -2,7 +2,17 @@
 
 from __future__ import annotations
 
-from pydantic import BaseModel
+from typing import Literal
+
+from pydantic import BaseModel, Field
+
+
+class WorkspaceRepoRemovedResponse(BaseModel):
+    """Response returned when a repo is removed from the workspace config."""
+
+    ok: bool = True
+    alias: str
+    remaining_repos: int
 
 
 class WorkspaceRepoEntry(BaseModel):
@@ -41,6 +51,9 @@ class WorkspaceRepoEntry(BaseModel):
 class WorkspaceCrossRepoSummary(BaseModel):
     co_change_count: int = 0
     package_dep_count: int = 0
+    package_diagnostic_count: int = 0
+    package_diagnostics_emitted: int = 0
+    package_diagnostic_codes: list[str] = []
     top_connections: list[dict] = []
 
 
@@ -118,6 +131,10 @@ class WorkspaceContractLinkEntry(BaseModel):
     #: than a display label. None when that side never bound to one.
     provider_symbol_id: str | None = None
     consumer_symbol_id: str | None = None
+    #: The consumer's own contract id when it is not spelled like ``contract_id``,
+    #: which names the provider's (a queue bound to that exchange, or a path
+    #: matched across case, a wildcard method or a mount prefix); None otherwise.
+    consumer_contract_id: str | None = None
 
 
 class WorkspaceContractsResponse(BaseModel):
@@ -168,6 +185,27 @@ class WorkspaceCoChangesResponse(BaseModel):
     #: of every pair in git history — each session's file list is bounded
     #: before pairing.
     total_mined: int = 0
+    #: The most pairs the miner keeps for any one repository pair, so a page
+    #: can say why every repository pair stops at the same count.
+    per_repo_pair_cap: int | None = None
+    #: The most pairs the miner keeps across the whole workspace.
+    total_cap: int | None = None
+    #: Which cap trimmed the stored overlay: ``"total"``, ``"per_repo_pair"``,
+    #: or None when nothing was dropped.
+    truncated_by: Literal["total", "per_repo_pair"] | None = None
+
+
+class WorkspaceCoChangeStructure(BaseModel):
+    """What declared structure connects one co-changing file pair."""
+
+    #: Contract links where one of the two files provides and the other consumes.
+    pair_links: list[WorkspaceContractLinkEntry]
+    #: Contract links between the two repositories through any files.
+    repo_links_total: int
+    repo_links_by_type: dict[str, int]
+    #: Contract links touching each file, whatever the other end.
+    source_file_links: int
+    target_file_links: int
 
 
 class WorkspaceGraphNode(BaseModel):
@@ -330,9 +368,15 @@ class WorkspaceBreakingChange(BaseModel):
     provider_repo: str
     provider_file: str
     provider_symbol: str
+    #: Looked-up id for the changed provider symbol; ``None`` when the
+    #: contract did not resolve to one.
+    provider_symbol_id: str | None = None
     provider_service: str | None = None
     provider_node_id: str = ""
     detail: str
+    side: str | None = None
+    comparison_source: str | None = None
+    comparison_key: str | None = None
     field_name: str | None = None
     old_value: str | None = None
     new_value: str | None = None
@@ -420,3 +464,80 @@ class WorkspaceArchitectureResponse(BaseModel):
     role_breakdown: dict[str, int] = {}
     roles: list[WorkspaceNodeArchitectureRole] = []
     generated_at: str = ""
+
+
+# ---------------------------------------------------------------------------
+# Cross-repo test impact: which consumer tests guard a provider change.
+# Mirrors repowise.core.workspace.test_impact.workspace_test_impact_to_dict.
+# ---------------------------------------------------------------------------
+
+
+class WorkspaceTestRecommendation(BaseModel):
+    """A test in a consumer repo that guards a changed provider file."""
+
+    test_id: str = ""
+    test_file: str = ""
+    consumer_repo: str = ""
+    #: Every consumer file that reached this test. One test can guard several
+    #: call sites, and merging rows on the test would otherwise drop all but
+    #: one of the files that led to it.
+    consumer_files: list[str] = []
+    #: The symbols the contracts bound to in the consumer. Carried through the
+    #: boundary so a caller can look the call sites up instead of guessing them
+    #: from the files.
+    consumer_symbol_ids: list[str] = []
+    provider_repo: str = ""
+    contract_ids: list[str] = []
+    contract_types: list[str] = []
+    basis: str = "inferred"  # measured | inferred
+    via: str = ""  # coverage-map | call-graph | import-graph
+    confidence: float = 0.0
+    source_files: list[str] = []
+    evidence: list[dict] = []
+
+
+class WorkspaceUnresolvedLink(BaseModel):
+    """A contract link the join could not follow, and why."""
+
+    consumer_repo: str = ""
+    consumer_file: str = ""
+    consumer_symbol_id: str | None = None
+    provider_repo: str = ""
+    provider_file: str = ""
+    contract_id: str = ""
+    contract_type: str = ""
+    reason: str = ""  # no_index | unbound | symbol_missing | lookup_failed
+    detail: str | None = None
+
+
+class WorkspaceTestImpactFile(BaseModel):
+    """One consumer file the join looked at, and the state it ended in."""
+
+    consumer_repo: str = ""
+    consumer_file: str = ""
+    state: str = "none"  # measured | inferred | none | unresolved
+    measured_tests_count: int = 0
+    inferred_tests_count: int = 0
+    via: str | None = None
+    provider_repos: list[str] = []
+    contract_ids: list[str] = []
+    consumer_symbol_ids: list[str] = []
+
+
+class WorkspaceTestImpactResponse(BaseModel):
+    """``GET /api/workspace/test-impact``: consumer tests for a provider change."""
+
+    workspace: bool = True
+    recommendations: list[WorkspaceTestRecommendation] = []
+    recommendations_total: int = 0
+    recommendations_emitted: int = 0
+    recommendations_truncated: bool = False
+    recommendations_omitted: int = 0
+    recommendations_by_basis: dict[str, int] = {}
+    recommendations_by_repo: dict[str, int] = {}
+    recommendations_by_consumer_repo: dict[str, int] = {}
+    unresolved: list[WorkspaceUnresolvedLink] = []
+    files_analyzed: list[WorkspaceTestImpactFile] = []
+    #: Free-form counters and the state that produced an empty answer, so an
+    #: empty response always names its reason.
+    summary: dict = Field(default_factory=dict)

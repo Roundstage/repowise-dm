@@ -7,8 +7,8 @@ ordinary computation?* That decomposes into two pieces:
 1. **Dependency classification** (this module) — which imported names in a file
    originate from an I/O library, and of what kind. Reuses the shared
    :func:`...ingestion.external_systems.io_kind.classify_io_kind` table
-   (Primitive 1) rather than a perf-private list, so the same maintained
-   classification powers C4 typing, the perf pass, and a future security layer.
+   rather than a perf-private list, so the same maintained classification
+   powers C4 typing, the perf pass, and a future security layer.
    :func:`collect_io_names` walks a file's import nodes and binds each imported
    identifier to its ``io_kind``. This step is **language-agnostic** — an import
    statement is a quoted module source (TS) or a dotted path (Python/Java/...);
@@ -155,6 +155,22 @@ def collect_io_names(tree_root: _NodeLike, language: str) -> dict[str, str]:
             )
             if method is not None and (method.text or b"") in (b"require", b"require_relative"):
                 kind, bound = _classify_import(node)
+                if kind is not None:
+                    for name in bound:
+                        names.setdefault(name, kind)
+        elif node.type == "declUses" and language == "pascal":
+            # Pascal's ``uses`` clause is one flat node listing every unit
+            # (``uses SysUtils, Classes, IdHTTP;``), unlike Go's grouped
+            # import which nests a per-line ``import_spec`` leaf. Classifying
+            # the whole node would pick whichever unit's kind resolves first
+            # out of an unordered set and bind ALL of them to it (so
+            # ``IdHTTP`` could inherit ``db`` from a ``FireDAC`` listed in the
+            # same clause) -- so each ``moduleName`` child is classified on
+            # its own instead.
+            for child in node.children:
+                if child.type != "moduleName":
+                    continue
+                kind, bound = _classify_import(child)
                 if kind is not None:
                     for name in bound:
                         names.setdefault(name, kind)

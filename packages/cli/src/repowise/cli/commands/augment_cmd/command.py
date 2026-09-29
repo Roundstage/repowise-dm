@@ -93,11 +93,13 @@ from pathlib import Path
 
 import click
 
+from repowise.cli._setup import configure_cli_logging
 from repowise.cli.agent_adapters import adapter_for
 
-from ._shared import HookResult, as_result
+from ._shared import HookResult, as_result, join_notices
 from .bash_staleness import _handle_bash_post
 from .codex import _handle_codex_context_event, _handle_post_edit_use
+from .decision_capture import commit_capture_notice
 from .read_state import _handle_edit_post, _handle_read_post, _record_edit
 from .search import _handle_search_post
 from .served_reads import _handle_mcp_read_post, _log_read_after_served
@@ -135,8 +137,16 @@ def _adapter(client: str | None):
     default=None,
     help="Hook client marker. Codex lifecycle hooks pass this explicitly.",
 )
-def augment_command(client: str | None = None) -> None:
+@click.option(
+    "--verbose",
+    "-v",
+    is_flag=True,
+    default=False,
+    help="Show debug logs from the hook pipeline.",
+)
+def augment_command(client: str | None = None, verbose: bool = False) -> None:
     """Enrich AI agent tool calls with codebase graph context (hook mode)."""
+    configure_cli_logging(verbose=verbose)
     try:
         _run_augment(client=client)
     except (SystemExit, KeyboardInterrupt):
@@ -380,7 +390,12 @@ def _handle_post_tool_use(
         # The PowerShell tool (Windows Claude Code) and Codex's several names
         # for its shell all surface the same stdout/stderr response shape as
         # Bash — one handler covers them.
-        return as_result(_handle_bash_post(tool_input, tool_output, cwd))
+        return as_result(
+            join_notices(
+                _handle_bash_post(tool_input, tool_output, cwd),
+                commit_capture_notice(tool_input, tool_output, cwd, session_id),
+            )
+        )
     if tool_name in adapter.search_tool_names:
         # The adapter reaches this one because the flood digest can *replace*
         # the tool output, and not every harness's protocol can honour that.

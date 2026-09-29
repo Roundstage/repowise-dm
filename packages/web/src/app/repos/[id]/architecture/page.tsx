@@ -26,6 +26,11 @@
  *   - `?view=`   communities | files | coupling | packages | symbols
  *   - `?signal=` dead | hot — which overlay is lit on the graph
  *   - `?module=` a path prefix the file scope is filtered to
+ *   - `?community=` the community the file scope is drilled into. One axis with
+ *     `?module=`: both narrow the file graph, so at most one is ever set.
+ *   - `?show=` which non-production files the community views count
+ *     (`tests,examples,docs`); absent means production only. `external` in
+ *     the same list draws third-party modules in the Files view.
  *
  * `?view=` and `?viewMode=` used to encode the same axis twice — `view=explore`
  * and `viewMode=full` both meant "the file graph", and they could disagree.
@@ -42,6 +47,7 @@ import { useRouter } from "next/navigation";
 import { useQueryState, parseAsStringLiteral } from "nuqs";
 import { Code2 } from "lucide-react";
 import { ViewTabs } from "@repowise-dev/ui/shared/view-tabs";
+import { ErrorBoundary } from "@repowise-dev/ui/shared";
 import { GraphView } from "@/components/architecture/graph-view";
 import { DependenciesView } from "@/components/architecture/dependencies-view";
 import { SymbolTableWrapper as SymbolTable } from "@/components/symbols/symbol-table-wrapper";
@@ -92,17 +98,26 @@ const TAB_FOR_VIEW: Record<CanonicalView, string> = {
   symbols: "symbols",
 };
 
+const TAB_PANEL_ID = "architecture-tab-panel";
+
 const TABS: { id: string; label: string }[] = [
   { id: "map", label: "Map" },
   { id: "coupling", label: "Coupling" },
-  { id: "packages", label: "Packages" },
+  { id: "packages", label: "Third-party" },
   { id: "symbols", label: "Symbols" },
 ];
 
-/** Landing view when a tab is clicked. Map opens on communities — the whole
- *  repo at a size you can read, rather than 1,500 circles. */
+/** Landing view when a tab is clicked, and for the page with no `?view=`.
+ *
+ * Map opens on Files. It used to open on Communities, because Files was 1,500
+ * circles with nothing to read them by. Files now draws each community as a
+ * named cluster with its bands and ranked file names, and a hover shows one
+ * file's real edges, so it answers "what is this repo made of" and "what does
+ * this file touch" on first paint. `?view=communities` still lands there.
+ */
+const DEFAULT_VIEW: CanonicalView = "files";
 const DEFAULT_VIEW_FOR_TAB: Record<string, CanonicalView> = {
-  map: "communities",
+  map: DEFAULT_VIEW,
   coupling: "coupling",
   packages: "packages",
   symbols: "symbols",
@@ -117,12 +132,15 @@ export default function ArchitecturePage({
   const router = useRouter();
   const [rawView, setView] = useQueryState(
     "view",
-    parseAsStringLiteral(VIEWS).withDefault("communities"),
+    parseAsStringLiteral(VIEWS).withDefault(DEFAULT_VIEW),
   );
   const [viewModeParam, setViewModeParam] = useQueryState("viewMode");
   const [, setSignal] = useQueryState("signal");
   const [, setModule] = useQueryState("module");
+  const [, setCommunity] = useQueryState("community");
+  const [, setShow] = useQueryState("show");
   const [, setFocus] = useQueryState("focus");
+  const [, setNode] = useQueryState("node");
 
   // The curated layers view now lives at /knowledge-graph. `?view=layers`
   // redirects there so shared links keep working.
@@ -153,14 +171,20 @@ export default function ArchitecturePage({
   // reads it and nothing shows it.
   const handleTabChange = useCallback(
     (id: string) => {
-      void setView(DEFAULT_VIEW_FOR_TAB[id] ?? "communities");
-      if (id !== "coupling") void setFocus(null);
+      void setView(DEFAULT_VIEW_FOR_TAB[id] ?? DEFAULT_VIEW);
+      // `?focus=` means a file path in Coupling and the literal "relationships"
+      // in Third-party, so carrying it across pins one tab's value in the
+      // other's vocabulary. Cleared on every change, not just when leaving.
+      void setFocus(null);
       if (id !== "map") {
         void setSignal(null);
         void setModule(null);
+        void setCommunity(null);
+        void setShow(null);
+        void setNode(null);
       }
     },
-    [setView, setFocus, setSignal, setModule],
+    [setView, setFocus, setSignal, setModule, setCommunity, setShow, setNode],
   );
 
   const handleScopeChange = useCallback(
@@ -177,10 +201,23 @@ export default function ArchitecturePage({
   return (
     <div className="flex h-full flex-col">
       <div className="shrink-0 px-4 pt-3 sm:px-6">
-        <ViewTabs tabs={TABS} value={activeTab} onValueChange={handleTabChange} />
+        <ViewTabs
+          tabs={TABS}
+          value={activeTab}
+          onValueChange={handleTabChange}
+          panelId={TAB_PANEL_ID}
+        />
       </div>
 
-      <div className="min-h-0 flex-1 overflow-auto">
+      {/* The panel is a flex sibling, not a ViewTabs child: the Map is a
+          full-height canvas that sizes itself from this box. */}
+      <div
+        id={TAB_PANEL_ID}
+        role="tabpanel"
+        aria-labelledby={`${TAB_PANEL_ID}-tab-${activeTab}`}
+        tabIndex={0}
+        className="min-h-0 flex-1 overflow-auto"
+      >
         {activeTab === "map" && (
           <GraphView
             repoId={repoId}
@@ -196,7 +233,9 @@ export default function ArchitecturePage({
           </div>
         )}
         {activeTab === "coupling" && (
-          <div className="mx-auto max-w-[1100px] p-4 sm:p-6">
+          <div className="mx-auto max-w-[1500px] p-4 sm:p-6">
+            {/* Wider than the other tabs: the pairs table carries a sentence
+                per row plus both modules. The ring keeps its own 820px cap. */}
             <div className="mb-2">
               <h1 className="mb-1 flex items-center gap-2 text-xl font-semibold text-[var(--color-text-primary)]">
                 <Code2 className="h-5 w-5 text-[var(--color-accent-primary)]" />
@@ -206,7 +245,11 @@ export default function ArchitecturePage({
                 {COUPLING_DISCLAIMER}
               </p>
             </div>
-            <CouplingTab repoId={repoId} />
+            {/* Contain a render throw to the tab instead of letting it reach
+                the route boundary and blank the page. */}
+            <ErrorBoundary title="Couldn't load change coupling">
+              <CouplingTab repoId={repoId} />
+            </ErrorBoundary>
           </div>
         )}
       </div>

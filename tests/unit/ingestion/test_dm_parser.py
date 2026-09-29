@@ -47,16 +47,17 @@ def test_extracts_dme_includes() -> None:
 
     parsed = ASTParser().parse_file(_file("DU.dme"), source)
 
-    assert [imp.module_path for imp in parsed.imports] == [
-        "src\\Code\\Combat\\SpeedDelay.dm"
-    ]
+    assert [imp.module_path for imp in parsed.imports] == ["src\\Code\\Combat\\SpeedDelay.dm"]
 
 
 def test_caps_legacy_parse_error_context_without_dropping_symbols() -> None:
-    source = (b"invalid syntax that the grammar cannot recover cleanly\n" * 200) + b"""\
+    source = (
+        (b"invalid syntax that the grammar cannot recover cleanly\n" * 200)
+        + b"""\
 /proc/stillIndexed()
 \treturn 1
 """
+    )
 
     parsed = ASTParser().parse_file(_file(), source)
 

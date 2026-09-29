@@ -26,10 +26,7 @@ def test_dme_windows_path_resolves_from_project_root() -> None:
 def test_nested_include_resolves_relative_to_importer() -> None:
     ctx = _ctx("src/Code/lib.dm", "src/Code/Combat/Skill.dm")
 
-    assert (
-        resolve_dm_include("../lib.dm", "src/Code/Combat/Skill.dm", ctx)
-        == "src/Code/lib.dm"
-    )
+    assert resolve_dm_include("../lib.dm", "src/Code/Combat/Skill.dm", ctx) == "src/Code/lib.dm"
     assert resolve_dm_include("lib.dm", "src/Code/Combat/Skill.dm", ctx) is None
 
 

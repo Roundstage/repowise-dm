@@ -2,7 +2,6 @@
 
 from ..spec import LanguageSpec
 
-
 SPEC = LanguageSpec(
     tag="dmf",
     display_name="BYOND Dream Maker Interface",

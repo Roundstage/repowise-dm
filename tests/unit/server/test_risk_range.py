@@ -179,3 +179,84 @@ def test_scores_excluding_omits_target_ref(git_repo: Path) -> None:
     assert len(scores_excluding(samples, head)) == 1
     assert len(scores_excluding(samples, head[:7])) == 1
     assert len(scores_excluding(samples, "")) == 2
+
+
+async def test_route_scores_through_the_shared_facade(
+    client: AsyncClient, git_repo: Path, tmp_path: Path
+) -> None:
+    """The route must not carry its own copy of the scoring composition.
+
+    It once repeated the features -> score -> fix-history -> baseline sequence
+    inline, with comments saying it matched the other surfaces. Two copies that
+    agree only by comment drift the first time one is edited, so this pins the
+    route's numbers to the facade every other surface uses.
+    """
+    from repowise.core.analysis.change_risk import (
+        assess_change,
+        extract_range_features,
+        fix_pressure,
+        range_anchor,
+    )
+
+    repo = await create_test_repo(client, tmp_path)
+    _commit(git_repo, {"src/f.py": "a = 1\nb = 2\n"}, "feat: f")
+    _commit(git_repo, {"src/g.py": "c = 3\n"}, "fix: crash")
+
+    response = await client.get(
+        f"/api/repos/{repo['id']}/risk/range",
+        params={"base": "HEAD~2", "head": "HEAD"},
+    )
+    assert response.status_code == 200
+    body = response.json()
+
+    anchor = range_anchor(str(git_repo), "HEAD~2", "HEAD")
+    samples = baseline_samples(str(git_repo), anchor, 200, ())
+    pressure = fix_pressure(str(git_repo), anchor)
+    expected = assess_change(
+        extract_range_features(str(git_repo), "HEAD~2", "HEAD"),
+        fix_pressure=pressure,
+        baseline_scores=scores_excluding(samples, ""),
+        baseline_fix_densities=densities_excluding(samples, "", pressure),
+    )
+
+    assert body["score"] == expected.risk.score
+    assert body["risk_percentile"] == expected.percentile
+    assert body["review_priority"] == expected.priority
+    assert body["fix_history"]["density"] == expected.fix_density
+    assert body["fix_history"]["percentile"] == expected.fix_percentile
+    assert body["fix_history"]["available"] == expected.fix_history_available
+
+
+@pytest.mark.asyncio
+async def test_patch_coverage_reads_stored_coverage(
+    client: AsyncClient, session, git_repo: Path, tmp_path: Path
+) -> None:
+    from repowise.core.analysis.health.coverage import file_coverage
+    from repowise.core.persistence.crud import save_coverage_files
+
+    base = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=git_repo, check=True, capture_output=True, text=True
+    ).stdout.strip()
+    head = _commit(git_repo, {"src/a.py": "x = 1\ny = 2\nz = 3\n"}, "feat: add a")
+    repo = await _register(client, tmp_path)
+    url = f"/api/repos/{repo['id']}/health/coverage/patch"
+
+    # Nothing ingested yet: null, not a zero.
+    empty = await client.get(url, params={"base": base})
+    assert empty.status_code == 200 and empty.json() is None
+
+    await save_coverage_files(
+        session,
+        repo["id"],
+        [file_coverage("src/a.py", [1, 2], [1, 2, 3])],
+        source_format="lcov",
+        ingested_commit_sha=head,
+    )
+    await session.commit()
+    data = (await client.get(url, params={"base": base})).json()
+
+    assert data["patch_coverage_pct"] == 66.66
+    assert data["files"][0]["uncovered_ranges"] == [[3, 3]]
+    assert data["scope"]["freshness"] == "current"
+    assert data["scope"]["label"] == f"{base}...HEAD"
+    assert (await client.get(url, params={"base": "nope"})).status_code == 400
